@@ -88,6 +88,7 @@ class ArgumentParser(HfArgumentParser):
 
             obj = data_class(**inputs)
             outputs.append(obj)
+
         for arg in other_args:
             if arg not in used_args:
                 raise ValueError(f"Argument provided not found in dataclass: {arg}")
@@ -98,11 +99,13 @@ class ArgumentParser(HfArgumentParser):
             # If we pass only one argument to the script and it's the path to a YAML file,
             # let's parse it to get our arguments.
             output = self.parse_yaml_file(os.path.abspath(sys.argv[1].split("=")[-1]))
+
         # parse command line args and yaml file
         elif len(sys.argv) > 2 and sys.argv[1].endswith(".yaml"):
             output = self.parse_yaml_and_args(
                 os.path.abspath(sys.argv[1].split("=")[-1]), sys.argv[2:]
             )
+
         # parse --config for the yaml path and other command line args
         elif any([arg.startswith("--config") for arg in sys.argv]):
             yaml_arg = [
@@ -114,6 +117,7 @@ class ArgumentParser(HfArgumentParser):
             output = self.parse_yaml_and_args(
                 os.path.abspath(yaml_arg.split("=")[-1]), other_args
             )
+
         # parse command line args only
         else:
             output = self.parse_args_into_dataclasses()
@@ -226,10 +230,6 @@ class TrainingArguments(TrainingArguments):
     lr_scheduler_kwargs: dict = field(
         default=None,
         metadata={"help": "Learning rate scheduler kwargs."},
-    )
-    warmup_steps: int = field(
-        default=100,
-        metadata={"help": "Number of warmup steps."},
     )
     eval_on_start: bool = field(
         default=False,
@@ -430,11 +430,6 @@ class DataArguments:
         default=None,
         metadata={"help": "Training dataset names."},
     )
-
-    streaming: bool = field(
-        default=False,
-        metadata={"help": "Whether to use streaming dataset for training."},
-    )
     val_ds_names: list[str] | None = field(
         default=None,
         metadata={"help": "Validation dataset names."},
@@ -442,6 +437,10 @@ class DataArguments:
     test_ds_names: list[str] | None = field(
         default=None,
         metadata={"help": "Test dataset names."},
+    )
+    streaming: bool = field(
+        default=False,
+        metadata={"help": "Whether to use streaming dataset for training."},
     )
     max_train_samples_per_ds: int | None = field(
         default=None,
@@ -454,6 +453,10 @@ class DataArguments:
     max_test_samples_per_ds: int | None = field(
         default=500,
         metadata={"help": "Maximum number of test samples per dataset."},
+    )
+    custom_train_splits: list[str] | None = field(
+        default=None,
+        metadata={"help": "Custom splits for a specific training dataset."},
     )
 
 
@@ -499,6 +502,19 @@ class HypernetArguments:
     )
     num_pre_head_layers: int = field(
         default=1, metadata={"help": "# of layers before hypernet head"}
+    )
+    chunk_lora_merge_mode: Literal["stack", "avg", "mlp", "deepsets", "attnpool"] = field(
+        default="stack",
+        metadata={
+            "help": (
+                "How to combine per-chunk LoRAs when a context is split into multiple chunks. "
+                "'stack': concatenate ranks (original behavior). "
+                "'avg': element-wise mean across chunks. "
+                "'mlp': trainable MLP-based weighted merge initialized to uniform averaging. "
+                "'deepsets': DeepSets-style permutation-invariant weighted merge. "
+                "'attnpool': attention pooling over chunk descriptors."
+            )
+        },
     )
 
 
@@ -550,6 +566,7 @@ class AggregatorArguments:
         default="mean",
         metadata={"help": "Pooling type for HyperLoRA."},
     )
+
     num_latent_factor: int = field(
         default=8,
         metadata={"help": "Number of latent factors for Perceiver."},

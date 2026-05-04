@@ -1,5 +1,8 @@
 import logging
 
+import sys
+sys.path.append("src")  # complains that there is no module ctx_to_lora without this
+
 from ctx_to_lora.eval_utils import run_eval
 
 logger = logging.getLogger()
@@ -24,7 +27,21 @@ if __name__ == "__main__":
     parser.add_argument(
         "--split",
         type=str,
-        choices=["validation", "test"],
+        choices=[
+            "validation", "test",
+            # Babilong evaluation
+            "test_0k",
+            "test_1k", "test_2k",
+            "test_4k", "test_8k",
+            "test_16k", "test_32k",
+            "test_64k", "test_128k",
+            # For base model babilong evaluation
+            "train_0k",
+            "train_1k", "train_2k",
+            "train_4k", "train_8k",
+            "train_16k", "train_32k",
+            "train_64k", "train_128k",
+        ],
         default="validation",
         help="Which split to evaluate on",
     )
@@ -162,6 +179,18 @@ if __name__ == "__main__":
         "--use_generative_adapter",
         action="store_true",
         help="Use generative adapter for evaluation",
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default=None,
+        help="The directory to store evaluation output",
+    )
+    parser.add_argument(
+        "--run_name",
+        type=str,
+        default=None,
+        help="The run name that will be used to save the output",
     )
 
     cli_args = vars(parser.parse_args())

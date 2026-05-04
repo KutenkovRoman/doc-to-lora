@@ -1,4 +1,7 @@
-import contextlib
+import sys
+sys.path.append("src")  # complains that there is no module ctx_to_lora without this
+
+# import contextlib
 import logging
 import os
 from copy import deepcopy
@@ -7,7 +10,7 @@ from functools import partial
 import numpy as np
 import torch
 import wandb
-from datasets import disable_caching
+from datasets import disable_caching, interleave_datasets
 from peft import PeftModel
 from transformers import (
     AutoConfig,
@@ -29,7 +32,7 @@ from ctx_to_lora.configs import (
 from ctx_to_lora.data.collator import (  # train_packed_collator,; DefaultDataCollator,
     flatten_if_not_packed,
 )
-from ctx_to_lora.data.processing import get_tokenized_dataset, pack
+from ctx_to_lora.data.processing import get_tokenized_dataset, pack, get_ds_prob
 from ctx_to_lora.metrics import (
     Evaluator,
     compute_metrics,
@@ -77,6 +80,7 @@ def main():
             CtxEncoderArguments,
         )
     )
+
     (
         data_args,
         ctx_args,
@@ -118,6 +122,7 @@ def main():
         if not checkpoint_dir
         else checkpoint_dir.strip("/").split("/")[-2]
     )
+    # run_name = "debug"  # to avoid creating lots of run directories when debugging
 
     output_dir = f"train_outputs/runs/{run_name}"
     setup_logging(output_dir, debug=os.getenv("DEBUG", False))
@@ -134,10 +139,11 @@ def main():
     training_args.logging_dir = output_dir
 
     if (
-        training_args.lr_scheduler_type == "cosine_with_min_lr"
-        and training_args.lr_scheduler_kwargs is None
+        training_args.lr_scheduler_type == "cosine_with_min_lr" and
+        training_args.lr_scheduler_kwargs is None
     ):
         training_args.lr_scheduler_kwargs = {"min_lr": 1e-7}
+
     args = {
         **vars(deepcopy(data_args)),
         **vars(deepcopy(ctx_args)),
@@ -159,17 +165,23 @@ def main():
             **vars(model_args),
             train=True,
             requires_grad=False,
-            peft_config=get_lora_config(model_name, **vars(lora_args)),
+            peft_config=(
+                # None if USE_RANDOM_REPR else
+                get_lora_config(model_name, **vars(lora_args))
+            ),
         )
+
         ctx_name = ctx_encoder_args.ctx_encoder_model_name_or_path
         if ctx_name is not None:
             ctx_encoder_model_config = AutoConfig.from_pretrained(
                 ctx_name, trust_remote_code=True
             )
-            if ("Llama" in ctx_name and "Vision" in ctx_name) or check_is_vision_model(
-                ctx_name
+            if (
+                ("Llama" in ctx_name and "Vision" in ctx_name) or
+                check_is_vision_model(ctx_name)
             ):
                 ctx_encoder_model_config = ctx_encoder_model_config.text_config
+
             ctx_tokenizer = get_tokenizer(ctx_name, train=True)
         else:
             ctx_name = base_model.base_model.config.name_or_path
@@ -186,21 +198,25 @@ def main():
                 aggregator_args,
                 ctx_encoder_args,
             )
+
             if ctx_encoder_args.layer_idx is None:
                 ctx_encoder_args.layer_idx = (
                     ctx_encoder_model_config.num_hidden_layers // 4
                 )
                 logger.info(
-                    f"Using the first {ctx_encoder_args.layer_idx} layers"
-                    " as the context encoder"
+                    f"Using the first {ctx_encoder_args.layer_idx} layers "
+                    f"as the context encoder"
                 )
+
             ctx_name = ctx_encoder_args.ctx_encoder_model_name_or_path
-            if ctx_encoder_args.ctx_encoder_last_layer is None and (
+
+            if (
+                ctx_encoder_args.ctx_encoder_last_layer is None and
                 ctx_name is not None and ctx_name != base_model.name_or_path
             ):
                 logger.info(
-                    f"Setting ctx_encoder_last_layer to {base_model.name_or_path} max layers"
-                    f":{base_model.config.num_hidden_layers}"
+                    f"Setting ctx_encoder_last_layer to {base_model.name_or_path} max layers: "
+                    f"{base_model.config.num_hidden_layers}"
                 )
                 ctx_encoder_args.ctx_encoder_last_layer = (
                     base_model.config.num_hidden_layers
@@ -215,6 +231,7 @@ def main():
                 ctx_args.from_pretrained_checkpoint = (
                     f"{checkpoint_dir}/pytorch_model.bin"
                 )
+
             logger.info(
                 f"Loading from checkpoint: {ctx_args.from_pretrained_checkpoint}"
             )
@@ -226,21 +243,22 @@ def main():
             )
             tokenizer = get_tokenizer(model.base_model.config.name_or_path, train=True)
             ctx_name = model.ctx_encoder_args.ctx_encoder_model_name_or_path
+
             if ctx_name is None:
                 ctx_name = model.base_model.config.name_or_path
+
             ctx_tokenizer = get_tokenizer(ctx_name, train=True)
 
         training_args.gen_lora_l1_reg_coef = ctx_args.gen_lora_l1_reg_coef
         training_args.use_kl_loss = ctx_args.use_kl_loss
         training_args.use_per_ctx_average_loss = ctx_args.use_per_ctx_average_loss
 
-        if len([p for p in model.ctx_encoder.parameters() if p.requires_grad]):
+        if any(p.requires_grad for p in model.ctx_encoder.parameters()):
             raise ValueError("ctx_encoder contains trainable parameters")
-        if len([p for p in model.base_model.parameters() if p.requires_grad]):
+        if any(p.requires_grad for p in model.base_model.parameters()):
             raise ValueError("base model contains trainable parameters")
 
         model.hypernet.compile(fullgraph=True, mode="max-autotune")
-
     else:
         # activate LoRA
         base_model_config = AutoConfig.from_pretrained(
@@ -260,12 +278,12 @@ def main():
 
     add_ctx_to_chat = not isinstance(model, ModulatedPretrainedModel)
     ctx_model_max_len = model.ctx_encoder.config.max_position_embeddings
+
     if ctx_args.max_ctx_len > 0:
         ctx_model_max_len = ctx_args.max_ctx_len
     if ctx_args.max_ctx_chunk_len <= 0:
         # set default chunk size to max length of the ctx encoder
         ctx_args.max_ctx_chunk_len = ctx_model_max_len
-
     if ctx_args.num_chunk_probs is not None:
         ctx_args.num_chunk_probs = {
             int(k): float(v) for k, v in ctx_args.num_chunk_probs.items()
@@ -287,57 +305,64 @@ def main():
         max_ctx_chunk_num=ctx_args.max_ctx_chunk_num,
         use_kl_loss=ctx_args.use_kl_loss,
     )
-    splits = ["train"]
-    if training_args.eval_strategy != "no":
-        splits.append("validation")
-    tokenized_ds = {split: {} for split in splits}
-    for split, ds_names in zip(
-        splits,
-        [data_args.train_ds_names, data_args.val_ds_names],
-    ):
-        if not ds_names:
-            continue
-        ctx_mgr = (
-            training_args.main_process_first()
-            if split == "train"
-            else contextlib.nullcontext()
+
+    if data_args.custom_train_splits is not None:
+        assert len(data_args.train_ds_names) == 1, (
+            "Custom train splits are only for one specific dataset"
         )
-        with ctx_mgr:
+        train_splits = data_args.custom_train_splits
+        logging.info(
+            f"Using custom train splits for {data_args.train_ds_names[0]}: " +
+            ", ".join(data_args.custom_train_splits)
+        )
+    else:
+        train_splits = ["train"]
+
+    train_ds = {}
+    for split in train_splits:
+        with training_args.main_process_first():
             # process and tokenize on the main process
             # then other replicas can just load the cached dataset
-            # we dont save cache for validation ds
-            for ds_name in ds_names:
-                ds = _get_tokenized_dataset(ds_name, split)
+            # we do not save cache for validation dataset
+            for ds_name in data_args.train_ds_names:
+                ds = _get_tokenized_dataset(ds_name, split, is_eval=False)
 
-                base_name = os.path.basename(ds_name)
-                if ds_name.startswith("self_gen/"):
-                    ds_name = "self_gen/" + base_name
-                else:
-                    ds_name = base_name
+                train_ds[
+                    ds_name + "/" + split
+                    if data_args.custom_train_splits is not None
+                    else ds_name
+                ] = ds
 
-                tokenized_ds[split][ds_name] = ds
-
-    train_ds = tokenized_ds["train"]
     if data_args.max_train_samples_per_ds is not None:
         for ds_name, ds in train_ds.items():
-            if data_args.max_train_samples_per_ds >= len(ds):
-                continue
-            train_ds[ds_name] = ds.take(data_args.max_train_samples_per_ds)
+            if len(ds) > data_args.max_train_samples_per_ds:
+                train_ds[ds_name] = ds.take(data_args.max_train_samples_per_ds)
+
     logging.info(f"train_ds: {train_ds}")
 
-    val_ds = dict()
-    if "validation" in tokenized_ds:
-        n_val_samples = data_args.max_val_samples_per_ds
-        for ds_name, ds in tokenized_ds["validation"].items():
-            if ds is None:
-                # take some samples from train_ds
-                ds = train_ds[ds_name].take(n_val_samples)
-                train_ds[ds_name] = train_ds[ds_name].skip(n_val_samples)
+    val_ds = {}
+    if training_args.eval_strategy != "no":
+        split = "validation"
+        for ds_name in data_args.val_ds_names:
+            ds = _get_tokenized_dataset(ds_name, split, is_eval=True)
+
+            base_name = os.path.basename(ds_name)
+            ds_name = (
+                "self_gen/" + base_name
+                if ds_name.startswith("self_gen/")
+                else base_name
+            )
 
             val_ds[ds_name] = ds
-            val_indices = np.random.permutation(len(ds))[:n_val_samples]
-            val_ds[ds_name] = val_ds[ds_name].select(val_indices)
 
+        if data_args.max_val_samples_per_ds is not None:
+            for ds_name, ds in val_ds.items():
+                if len(ds) > data_args.max_val_samples_per_ds:
+                    val_ds[ds_name] = ds.take(data_args.max_val_samples_per_ds)
+
+        logger.info(f"val_ds: {val_ds}")
+
+    # if ctx_args.use_sequence_packing:
     with training_args.main_process_first():
         train_ds = pack(
             train_ds,
@@ -349,17 +374,42 @@ def main():
         )
         logger.info("Setting per_device_train_batch_size to 1")
         training_args.per_device_train_batch_size = 1
+    # else:  # does not really work
+    #     train_ds_lens = [len(ds) for ds in train_ds.values()]
+    #     total_samples = sum(train_ds_lens)
+    #     train_ds = interleave_datasets(
+    #         list(train_ds.values()),
+    #         probabilities=get_ds_prob(train_ds_lens, total_samples),
+    #         seed=training_args.seed,
+    #         stopping_strategy="all_exhausted",
+    #     )
+    #     logger.info(f"Interleaved train dataset: {train_ds}")
 
-    logger.info(f"train_ds: {train_ds}")
-    logger.info(f"val_ds: {val_ds}")
+    # max_prod = 0
+    # seq_len_max = bs_max = 0
+    # for sample in train_ds:
+    #     ctx_position_ids = sample["ctx_position_ids"]
+    #     seq_len = len(ctx_position_ids)
+    #     bs = (np.array(ctx_position_ids) == 0).sum().item()
+    #     prod = seq_len * bs
+    #     if prod > max_prod:
+    #         max_prod = prod
+    #         seq_len_max = seq_len
+    #         bs_max = bs
+    # seq_len_max *= 26
+    # bs_max *= 26
+    # max_prod = seq_len_max * bs_max
+    # print(f"We have {max_prod = } with seq_len = {seq_len_max} * bs = {bs_max}")
+    # print(f"Dataset stats: {max_seq_len = } and {max_bs = }")
 
     collator = flatten_if_not_packed
 
     if isinstance(model, ModulatedPretrainedModel):
-        if isinstance(model.base_model, PeftModel):
-            base_model = model.base_model.base_model
-        else:
-            base_model = model.base_model
+        base_model = (
+            model.base_model.base_model
+            if isinstance(model.base_model, PeftModel)
+            else model.base_model
+        )
 
         if ctx_name is not None:
             logger.info("Compiling ctx_encoder_model")

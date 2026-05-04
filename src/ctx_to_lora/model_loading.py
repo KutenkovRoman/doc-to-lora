@@ -59,7 +59,7 @@ def get_model_and_tokenizer(
 def get_tokenizer(
     model_name_or_path, tokenizer_kwargs=None, peft_config=None, train=False
 ):
-    padding_side = "left" if not train else "right"
+    padding_side = "right" if train else "left"
     truncation_side = "left"
 
     if tokenizer_kwargs is None:
@@ -89,6 +89,7 @@ def get_tokenizer(
     chat_template = open(template_path).read()
     chat_template = chat_template.replace("    ", "").replace("\n", "")
     tokenizer.chat_template = chat_template
+
     return tokenizer
 
 
@@ -148,6 +149,7 @@ def get_model(
         model_init_kwargs["quantization_config"] = bnb_config
 
     logger.debug(f"Model init kwargs: {model_init_kwargs}")
+
     if not is_vision_model:
         if is_bidir_model:
             model = AutoModel.from_pretrained(**model_init_kwargs)
@@ -156,11 +158,14 @@ def get_model(
     else:
         model = Gemma3ForConditionalGeneration.from_pretrained(**model_init_kwargs)
         model = model.language_model
+
     if peft_config is not None:
         model = PeftModel(model, peft_config)
+
     model.train(train)
-    for name, param in model.named_parameters():
+    for _, param in model.named_parameters():
         param.requires_grad = requires_grad
+
     return model
 
 
@@ -168,6 +173,7 @@ def get_lora_config(model_dir, **kwargs):
     if "target_modules" not in kwargs or kwargs["target_modules"] is None:
         logger.info("No target modules specified for LoRA.")
         return None
+
     r = kwargs.pop("lora_r", 8)
     peft_conf_kwargs = dict(
         r=r,
@@ -175,7 +181,7 @@ def get_lora_config(model_dir, **kwargs):
         base_model_name_or_path=model_dir,
         task_type="CAUSAL_LM",
         lora_dropout=kwargs.get("lora_dropout", 0.0),
-        lora_alpha=r ** (3 / 2) * 2,
+        lora_alpha=(r ** (3 / 2) * 2),
     )
 
     peft_conf_kwargs.update(kwargs)

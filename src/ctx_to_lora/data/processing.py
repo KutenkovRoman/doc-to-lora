@@ -87,6 +87,11 @@ def load_answers(ds_name, split):
         def extract_ans(sample):
             return {"answers": sample["answers_spans"]["spans"]}
 
+    elif ds_name.startswith("babilong"):
+
+        def extract_ans(sample):
+            return {"answers": sample["target"]}
+
     ds_kwargs = get_ds_kwargs(ds_name, split)
     ds = load_dataset(**ds_kwargs, trust_remote_code=True)
     ds = ds.map(extract_ans, num_proc=8, remove_columns=ds.column_names)
@@ -133,14 +138,17 @@ def get_ds_kwargs(ds_name: str, split: str) -> dict[str, Any]:
                 f"in {SELF_GEN_DATA_DIR}/{base_model_name}/{base_ds}/"
             )
         kwargs = dict(path="parquet", data_files=files, split="train")
+
     elif (ds_name not in DS_KWARGS) or (split not in DS_KWARGS[ds_name]):
         kwargs = dict(path=ds_name, split=split)
         logger.warning(
             f"No dataset kwargs found for '{ds_name}' with split '{split}'.\n"
             f"Using default kwargs: {kwargs}"
         )
+
     else:
         kwargs = DS_KWARGS[ds_name][split]
+
 
     if skip:
         kwargs["skip"] = int(skip)
@@ -197,20 +205,22 @@ def add_negative_prompt_fn(samples):
         neg_responses.append(responses[j])
 
     return dict(
-        context=neg_ctxs + samples["context"],
-        prompt=neg_prompts + samples["prompt"],
-        response=neg_responses + samples["response"],
+        context=(neg_ctxs + samples["context"]),
+        prompt=(neg_prompts + samples["prompt"]),
+        response=(neg_responses + samples["response"]),
     )
 
 
 def load_and_process_dataset(
     ds_name: str,
     split: str,
+    is_eval: bool,
     add_negative_prompt: bool,
     num_proc: int,
     remove_cols: bool = True,
 ):
     logger.info(f"Loading dataset {ds_name} with split {split}...")
+
     try:
         ds_kwargs = get_ds_kwargs(ds_name, split)
         skip = ds_kwargs.pop("skip", None)
@@ -224,22 +234,24 @@ def load_and_process_dataset(
         raise ValueError(
             f"Failed to load dataset {ds_name} with split {split}. Error: {e}"
         )
+
     cols_to_remove = None
     if remove_cols:
         cols_to_remove = [
             col for col in ds.column_names if col not in COLS_TO_KEEP_PREPROCESSING
         ]
-    is_eval = split != "train"
+
     ds = ds.map(
         get_preprocessing_fn(ds_name, is_eval),
         remove_columns=cols_to_remove,
-        num_proc=16,
+        num_proc=num_proc,
     )
     ds = ds.filter(
         filter_none,
         batched=False,
-        num_proc=16,
+        num_proc=num_proc,
     )
+
     if add_negative_prompt and "context" in ds:
         ds = ds.map(
             add_negative_prompt_fn,
@@ -247,17 +259,19 @@ def load_and_process_dataset(
             batch_size=100_000,
             # num_proc=num_proc,
         )
+
     return ds
 
 
 def get_tokenized_dataset(
     ds_name: str,
     split: str,
+    is_eval: bool,
     max_qas_len: int,
     max_qas_per_sample: int,
     base_model_max_len: int,
     tokenizer: PreTrainedTokenizerBase,
-    ctx_model_max_len: int,
+    ctx_model_max_len: int | None,
     ctx_tokenizer: PreTrainedTokenizerBase,
     max_ctx_chunk_len: int,
     min_ctx_chunk_len: int,
@@ -275,7 +289,7 @@ def get_tokenized_dataset(
 ) -> dict[str, Any]:
     if max_qas_len > 0:
         assert max_qas_len <= base_model_max_len, (
-            f"`max_qas_len` should be <= {base_model_max_len=}, got {max_qas_len=}"
+            f"`max_qas_len` should be <= {base_model_max_len = }, got {max_qas_len = }"
         )
     logger.info(f"Loading dataset {ds_name} with split {split}...")
     need_ctx_ids = ctx_model_max_len is not None
@@ -283,6 +297,7 @@ def get_tokenized_dataset(
     load_and_process_kwargs = dict(
         ds_name=ds_name,
         split=split,
+        is_eval=is_eval,
         add_negative_prompt=add_negative_prompt,
     )
     tokenize_kwargs = dict(
@@ -296,7 +311,7 @@ def get_tokenized_dataset(
         num_chunk_probs=num_chunk_probs,
         max_ctx_chunk_num=max_ctx_chunk_num,
         need_ctx_ids=need_ctx_ids,
-        split=split,
+        is_train=(not is_eval),
         max_new_tokens=max_new_tokens,
         set_format=set_format,
     )
@@ -310,11 +325,11 @@ def get_tokenized_dataset(
     logger.debug(f"Dataset hash: {ds_hash}")
     ds_path = f"{TRANSFORMED_DATA_DIR}/{ds_hash}"
 
-    if path.exists(ds_path) and ("train" in split) and is_caching_enabled():
+    if path.exists(ds_path) and not is_eval and is_caching_enabled():
         # load the cached ds
         logger.info(f"Loaded tokenized dataset from {ds_path}")
         tokenized_ds = datasets.load_from_disk(ds_path)
-        if (not use_kl_loss) and ("logprobs_vals" in tokenized_ds.column_names):
+        if not use_kl_loss and "logprobs_vals" in tokenized_ds.column_names:
             tokenized_ds = tokenized_ds.remove_columns(
                 ["logprobs_vals", "logprobs_indices"]
             )
@@ -325,14 +340,16 @@ def get_tokenized_dataset(
         **load_and_process_kwargs,
         num_proc=num_proc,
     )
-    if use_kl_loss:
-        if "train" in split and "logprobs_vals" not in ds.column_names:
-            raise ValueError(
-                "`use_kl_loss` is set to True but 'logprobs_vals' column "
-                "is not present in the dataset."
-            )
+
+    if use_kl_loss and not is_eval and "logprobs_vals" not in ds.column_names:
+        raise ValueError(
+            "`use_kl_loss` is set to True but 'logprobs_vals' column "
+            "is not present in the dataset."
+        )
+
     logger.info(f"Constructing and tokenizing {ds_name} with {split} split...")
-    if flip_ctx_inp:
+
+    if flip_ctx_inp:  # for additional experiments?
 
         def squeeze(sample, column):
             first_id = sample[column][0]
@@ -361,13 +378,13 @@ def get_tokenized_dataset(
         **tokenize_kwargs,
     )
 
-    if ("train" in split) and is_caching_enabled():
+    if not is_eval and is_caching_enabled():
         tokenized_ds = tokenized_ds.shuffle()
         tokenized_ds.save_to_disk(ds_path, num_proc=16)
         # force reload from disk for fingerprint consistency
         tokenized_ds = datasets.load_from_disk(ds_path)
 
-    if (not use_kl_loss) and ("logprobs_vals" in tokenized_ds.column_names):
+    if not use_kl_loss and "logprobs_vals" in tokenized_ds.column_names:
         tokenized_ds = tokenized_ds.remove_columns(
             ["logprobs_vals", "logprobs_indices"]
         )
@@ -375,6 +392,7 @@ def get_tokenized_dataset(
     return tokenized_ds
 
 
+# Extension of get_tokenized_dataset, always used
 def construct_and_tokenize_ctx_qa(
     max_qas_len,
     max_qas_per_sample,
@@ -389,7 +407,7 @@ def construct_and_tokenize_ctx_qa(
     num_chunk_probs,
     max_ctx_chunk_num,
     ds,
-    split,
+    is_train,
     max_new_tokens,
     add_self_distill_template=False,
     set_format=None,
@@ -397,7 +415,6 @@ def construct_and_tokenize_ctx_qa(
     truncate_if_too_long_inp=False,
     truncate_if_too_long_ctx=False,
 ):
-    is_train = "train" in split
     # for sft + chat_model, we need to convert the dataset to chat format
     if "input_ids" in ds.column_names and "response_start_end" in ds.column_names:
         # already tokenized dataset (e.g., self-gen qa data)
@@ -413,6 +430,7 @@ def construct_and_tokenize_ctx_qa(
             },
             num_proc=16,
         )
+
         # add `input_ids`, `attention_mask`, `labels`
         os.environ["TOKENIZERS_PARALLELISM"] = "true"
         logging.debug("Tokenizing inputs")
@@ -424,17 +442,18 @@ def construct_and_tokenize_ctx_qa(
         )
 
     tokenized_ds = tokenized_ds.remove_columns(
-        [col for col in tokenized_ds.column_names if col not in COLS_TO_KEEP_TOKENIZED],
+        [col for col in tokenized_ds.column_names if col not in COLS_TO_KEEP_TOKENIZED]
     )
     tokenized_ds = tokenized_ds.filter(
         lambda x: bool(x["input_ids"]),  # remove empty "input_ids"
         num_proc=16,
     )
 
+    # False when loading base (not modulated) model
     if need_ctx_ids:
         if (
-            tokenizer.name_or_path != ctx_tokenizer.name_or_path
-            and "ctx_ids" in tokenized_ds.column_names
+            tokenizer.name_or_path != ctx_tokenizer.name_or_path and
+            "ctx_ids" in tokenized_ds.column_names
         ):
             logger.info("Detokenizing contexts...")
             tokenized_ds = tokenized_ds.map(
@@ -471,7 +490,9 @@ def construct_and_tokenize_ctx_qa(
             "model_name_or_path": tokenizer.name_or_path,
             "is_train": is_train,
         }
-        logging.info(f"Chunking context with {split_ctx_kwargs=}")
+
+        logging.info(f"Chunking context with {split_ctx_kwargs = }")
+
         tokenized_ds = tokenized_ds.map(
             split_too_long_ctx,
             fn_kwargs=split_ctx_kwargs,
@@ -482,13 +503,16 @@ def construct_and_tokenize_ctx_qa(
         logging.info(
             f"Avg. num chunks per ctx: {np.mean(tokenized_ds['n_ctx_chunks'])}"
         )
+
         tokenized_ds = tokenized_ds.remove_columns(["n_ctx_chunks"])
 
         split_qa_kwargs = {
             "max_qas_len": max_qas_len,
             "max_qas_per_sample": max_qas_per_sample,
         }
-        logging.info(f"Split too long QAs with {split_qa_kwargs=}")
+
+        logging.info(f"Splitting too long QAs with {split_qa_kwargs = }")
+
         tokenized_ds = tokenized_ds.map(
             split_too_long_qas,
             fn_kwargs=split_qa_kwargs,
@@ -496,7 +520,8 @@ def construct_and_tokenize_ctx_qa(
             batch_size=12_500,
             num_proc=16,
         )
-    if "train" not in split:
+
+    if not is_train:
         # squeeze since we always have one query per sample in eval
         tokenized_ds = tokenized_ds.map(squeeze_tokens, num_proc=num_proc)
         tokenized_ds = tokenized_ds.map(
@@ -554,9 +579,9 @@ def get_labels_from_input_ids(sample: dict[str, Any]) -> dict[str, Any]:
         pad_len_left = start_i
         pad_len_right = len_input_ids - end_i
         labels.append(
-            [IGNORE_INDEX] * pad_len_left
-            + input_ids_i[start_i:]
-            + [IGNORE_INDEX] * pad_len_right
+            [IGNORE_INDEX] * pad_len_left +
+            input_ids_i[start_i:] +
+            [IGNORE_INDEX] * pad_len_right
         )
 
     sample["labels"] = labels
@@ -606,16 +631,18 @@ def get_sft_prompt_formatting_fn(
 
         labels = []
         for tok_ids, masks in zip(tokens["input_ids"], tokens["assistant_masks"]):
-            o = [id_ if mask else IGNORE_INDEX for id_, mask in zip(tok_ids, masks)]
-            labels.append(o)
+            labels.append(
+                [id_ if mask else IGNORE_INDEX for id_, mask in zip(tok_ids, masks)]
+            )
 
         del tokens["assistant_masks"]
         tokens["labels"] = labels
+
         per_ctx_tokens = {"input_ids": [], "labels": []}
         i = 0
         for n in n_queries:
-            per_ctx_tokens["input_ids"].append(tokens["input_ids"][i : i + n])
-            per_ctx_tokens["labels"].append(tokens["labels"][i : i + n])
+            per_ctx_tokens["input_ids"].append(tokens["input_ids"][i:(i + n)])
+            per_ctx_tokens["labels"].append(tokens["labels"][i:(i + n)])
             i += n
 
         return per_ctx_tokens
@@ -657,17 +684,19 @@ def convert_ctx_prompt_response_to_messages(
     for prompt, response in zip(example[prompt_field], example[res_field]):
         user_msg = prompt.strip()
         if add_ctx_to_chat:
-            if add_self_distill_template:
-                user_msg = QA_PROMPT_TEMPLATE.format(
-                    context=example["context"].strip(), question=user_msg
+            ctx = example["context"].strip()
+            user_msg = (
+                QA_PROMPT_TEMPLATE.format(
+                    context=ctx, question=user_msg
                 )
-            else:
-                user_msg = example["context"].strip() + "\n\n" + user_msg
+                if add_self_distill_template
+                else ctx + "\n\n" + user_msg
+            ).strip()
 
         messages_list.append(
             [
-                {"role": "system", "content": system_msg.strip()},
-                {"role": "user", "content": user_msg.strip()},
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
                 {"role": "assistant", "content": response},
             ]
         )
@@ -688,7 +717,7 @@ def split_too_long_ctx(
     Split context into smaller chunks if it exceeds the maximum length.
 
     Args:
-        samples: Dictionary containing 'ctx_ids' and 'ctx_attn_mask'
+        sample: Dictionary containing 'ctx_ids' and 'ctx_attn_mask'
         max_chunk_len: Maximum length for each context chunk
         max_num_split: Maximum number of splits allowed
 
@@ -696,43 +725,46 @@ def split_too_long_ctx(
         Dictionary with split context data
     """
 
-    chunk_len = max_chunk_len
+    #chunk_len = max_chunk_len  # what is the point of this variable?
     ctx_ids = sample["ctx_ids"]
+
     # Early exits
-    if chunk_len <= 0 and max_num_split is None:
+    if max_chunk_len <= 0 and max_num_split is None:
         return {"ctx_ids": [ctx_ids], "n_ctx_chunks": 1}
 
     n_chunks = None  # will be sampled (train) or derived (eval)
     if is_train and num_chunk_probs is not None:
         # Adjust theoretical upper bound based on min_chunk_len if provided
-        if min_chunk_len:
+        if min_chunk_len > 0:
             max_num_split = ceil(len(ctx_ids) / min_chunk_len)
         # New logic: sample number of chunks from num_chunk_probs (after filtering)
 
         # Keep only feasible chunk counts <= max_num_split and > 0
-        if max_num_split is not None:
-            filt = {k: v for k, v in num_chunk_probs.items() if 0 < k <= max_num_split}
-        else:
-            filt = num_chunk_probs
+        filt = (
+            {k: v for k, v in num_chunk_probs.items() if 0 < k <= max_num_split}
+            if max_num_split is not None
+            else num_chunk_probs
+        )
 
         # Ensure each chunk will not exceed max_chunk_len; enforce minimum required chunks
-        min_required = (
-            max(1, ceil(len(ctx_ids) / max_chunk_len)) if max_chunk_len > 0 else 1
-        )
-        # Remove options that would yield chunk length > max_chunk_len
-        filt = {k: v for k, v in filt.items() if k >= min_required}
+        if max_chunk_len > 0:
+            min_required = ceil(len(ctx_ids) / max_chunk_len)
+
+            # Remove options that would yield chunk length > max_chunk_len
+            if min_required > 1:
+                filt = {k: v for k, v in filt.items() if k >= min_required}
+
         n_chunks = choices(list(filt.keys()), weights=list(filt.values()), k=1)[0]
 
     # Derive n_chunks if not sampled (e.g., eval or fallback)
     if n_chunks is None:
-        n_chunks = ceil(len(ctx_ids) / chunk_len)
-    # Safety: at least 1
-    n_chunks = max(1, n_chunks)
+        n_chunks = max(1, ceil(len(ctx_ids) / max_chunk_len))
+
     if n_chunks == 1:
         return {"ctx_ids": [ctx_ids], "n_ctx_chunks": 1}
 
     avg_len = ceil(len(ctx_ids) / n_chunks)
-    chunks = [ctx_ids[i : i + avg_len] for i in range(0, len(ctx_ids), avg_len)]
+    chunks = [ctx_ids[i:(i + avg_len)] for i in range(0, len(ctx_ids), avg_len)]
 
     ctx_affixes = CTX_AFFIXES[model_name_or_path]
     prefix = ctx_affixes["prefix"]
@@ -747,29 +779,40 @@ def split_too_long_ctx(
 
 
 def split_too_long_qas(
-    samples: dict[str, any], max_qas_len: int, max_qas_per_sample: int
+    samples: dict[str, any],
+    max_qas_len: int,
+    max_qas_per_sample: int,
 ):
-    # samples keys: "input_ids", "attention_mask", "labels", "ctx_ids", "ctx_attn_mask"
+    # Intuitively if we have a context and multiple questions, if either a number of
+    # questions or their total length (in tokens) exceeds a limit, then we copy context
+    # and split questions between samples with shared context to fit into limits
+
+    # samples' keys: "input_ids", "attention_mask", "labels", "ctx_ids", "ctx_attn_mask"
     # split the qas into multiple samples if they are too long
     # e.g., if max_qas_len = 512, and qas is 1024 tokens long,
     # we split it such that each sample has at most 512 tokens
     # and the ctx_ids and ctx_attn_mask are the same for all samples
     if max_qas_len < 0 and max_qas_per_sample < 0:
         return samples
+
     input_ids = samples["input_ids"]
     labels = samples["labels"]
     ctx_ids = samples["ctx_ids"]
     target_logprobs_vals = samples.get("logprobs_vals", None)
     target_logprobs_indices = samples.get("logprobs_indices", None)
 
+    # From my understanding at this point we have batch_size contexts and inputs
+    # Each context is chunked (it is a list of size <= maximum number of chunks)
+    # Each input is a sequence of multiple questions
+
     # Pre-calculate total lengths to check if any splitting is needed
-    total_lengths = [sum(len(x) for x in seq) for seq in input_ids]
+    total_lengths = [sum(len(q) for q in sequence) for sequence in input_ids]
     longest_old_qas_len = max(total_lengths) if total_lengths else 0
 
     # Early exit if no splitting needed
-    if (max_qas_len < 0 or all(length <= max_qas_len for length in total_lengths)) and (
-        max_qas_per_sample < 0
-        or all(len(seq) <= max_qas_per_sample for seq in input_ids)
+    if (
+        (max_qas_len < 0 or all(length <= max_qas_len for length in total_lengths)) and 
+        (max_qas_per_sample < 0 or all(len(seq) <= max_qas_per_sample for seq in input_ids))
     ):
         logger.debug(f"Longest old qas len: {longest_old_qas_len}")
         logger.debug(f"Longest new qas len: {longest_old_qas_len}")
@@ -798,10 +841,11 @@ def split_too_long_qas(
             out["logprobs_indices"].append(target_indices_batch)
 
     for i, tot_inp_len in enumerate(total_lengths):
-        if (max_qas_len < 0 or tot_inp_len <= max_qas_len) and (
-            max_qas_per_sample < 0 or len(input_ids[i]) <= max_qas_per_sample
+        if (
+            (max_qas_len < 0 or tot_inp_len <= max_qas_len) and
+            (max_qas_per_sample < 0 or len(input_ids[i]) <= max_qas_per_sample)
         ):
-            # No need to split - add entire sample
+            # No need to split, add entire sample
             for k in samples:
                 out[k].append(samples[k][i])
             continue
@@ -814,14 +858,16 @@ def split_too_long_qas(
         new_target_vals = [] if has_target_logprobs else None
         new_target_indices = [] if has_target_logprobs else None
 
-        sequences = zip(input_ids[i], labels[i])
-        if has_target_logprobs:
-            sequences = zip(
+        sequences = (
+            zip(
                 input_ids[i],
                 labels[i],
                 target_logprobs_vals[i],
                 target_logprobs_indices[i],
             )
+            if has_target_logprobs
+            else zip(input_ids[i], labels[i])
+        )
 
         for seq_data in sequences:
             if has_target_logprobs:
@@ -838,8 +884,9 @@ def split_too_long_qas(
 
             # Check if we can add to current batch (both length and sample count limits)
             can_add_to_current = (
-                max_qas_len < 0 or new_qas_len + inp_len <= max_qas_len
-            ) and (max_qas_per_sample < 0 or len(new_input_ids) < max_qas_per_sample)
+                (max_qas_len < 0 or new_qas_len + inp_len <= max_qas_len) and
+                (max_qas_per_sample < 0 or len(new_input_ids) < max_qas_per_sample)
+            )
 
             if can_add_to_current:
                 # Add to current batch
@@ -975,37 +1022,36 @@ def detokenize_ctx_text(
     tokenizer: PreTrainedTokenizerBase,
 ) -> dict[str, Any]:
     contexts = tokenizer.batch_decode(samples["ctx_ids"])
-    return dict(context=contexts)
+    return {"context": contexts}
 
 
 def tokenize_ctx_text(
     samples: dict[str, Any],
     tokenizer: PreTrainedTokenizerBase,
 ) -> dict[str, Any]:
-    if tokenizer.chat_template:
-        tokenized_text = tokenizer.apply_chat_template(
-            [
-                [
-                    {"role": "system", "content": ""},
-                    {"role": "user", "content": ctx.strip()},
-                ]
-                if isinstance(ctx, str)
-                else ctx
-                for ctx in samples["context"]
-            ],
-            tokenize=True,
-            add_generation_prompt=True,
-            return_attention_mask=False,
-            padding=False,
-            truncation=False,
-            add_special_tokens=False,  # special tokens are already added by the chat template
-            return_dict=True,
-        )
-    else:
+    if not tokenizer.chat_template:
         raise NotImplementedError("Only support chat models.")
 
-    ctx_ids = tokenized_text["input_ids"]
-    return dict(ctx_ids=ctx_ids)
+    tokenized_text = tokenizer.apply_chat_template(
+        [
+            [
+                {"role": "system", "content": ""},
+                {"role": "user", "content": ctx.strip()},
+            ]
+            if isinstance(ctx, str)
+            else ctx
+            for ctx in samples["context"]
+        ],
+        tokenize=True,
+        add_generation_prompt=True,
+        return_attention_mask=False,
+        padding=False,
+        truncation=False,
+        add_special_tokens=False,  # special tokens are already added by the chat template
+        return_dict=True,
+    )
+
+    return {"ctx_ids": tokenized_text["input_ids"]}
 
 
 def pack(
@@ -1031,7 +1077,7 @@ def pack(
     ds_hash = sha256((ds_fingerprint + json.dumps(kwargs)).encode()).hexdigest()
     ds_path = f"{TRANSFORMED_DATA_DIR}/packed_{ds_hash}"
     logger.info(
-        f"Packing ds {ds_hash} with {max_packed_inp_len=} and {max_packed_ctx_len=}"
+        f"Packing ds {ds_hash} with {max_packed_inp_len = } and {max_packed_ctx_len = }"
     )
     if path.exists(ds_path) and is_caching_enabled():
         logger.info(f"Loading a cached packed dataset for {ds_path}")

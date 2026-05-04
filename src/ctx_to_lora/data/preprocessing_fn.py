@@ -158,6 +158,17 @@ def get_preprocessing_fn(
             q = closed_qa_prompting(q) if not is_eval else q
             return {"context": ctx, "prompt": q, "response": response}
 
+    elif ds_name.startswith("babilong"):
+
+        def f(sample):
+            return {
+                "context": sample["input"].replace("\n", " "),  #.rstrip(".,:;!?-\'\" ")
+                # For now prompt only has a question unlike in babilong repo where there are
+                # additional examples and instruction on how to format answer
+                "prompt": sample["question"],
+                "response": sample["target"],
+            }
+
     if is_eval and (ds_name in EVAL_INTX_TEMPLATES):
         prompt_template = EVAL_INTX_TEMPLATES[ds_name]
 

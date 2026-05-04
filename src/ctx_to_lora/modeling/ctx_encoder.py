@@ -55,9 +55,9 @@ class EarlyExit(nn.Module):
         super().__init__()
         base_model = get_base_model(base_model)
         if "gte" in base_model.config.name_or_path:
-            base_model.encoder.layer = base_model.encoder.layer[: config.layer_idx]
+            base_model.encoder.layer = base_model.encoder.layer[:config.layer_idx]
         else:
-            base_model.layers = base_model.layers[: config.layer_idx]
+            base_model.layers = base_model.layers[:config.layer_idx]
 
         self.base_model = base_model
 

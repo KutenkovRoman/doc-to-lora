@@ -105,7 +105,8 @@ def eval_collator(inp_list, tokenizer):
 
 def generation_collator(inp_list, tokenizer):
     padding_kwargs = dict(padding=True, padding_side="left", return_tensors="pt")
-    input_ids = [torch.tensor(x.pop("input_ids")) for x in inp_list]
+    # before: input_ids = [torch.tensor(x.pop("input_ids")) for x in inp_list]
+    input_ids = [x.pop("input_ids") for x in inp_list]
     labels = [x.pop("labels") for x in inp_list]
     for i, label in enumerate(labels):
         # we don't include the labels in the output during generation
@@ -125,7 +126,8 @@ def generation_collator(inp_list, tokenizer):
         ctx_ids = [example.pop("ctx_ids") for example in inp_list]
         n_chunks = [len(x) for x in ctx_ids]
         ctx_ids = concat_list(ctx_ids)
-        ctx_ids = [torch.tensor(x) for x in ctx_ids]
+        #ctx_ids = [torch.tensor(x) for x in ctx_ids]
+        ctx_ids = [x for x in ctx_ids]
         ctx_attn_mask = [torch.ones_like(x) for x in ctx_ids]
 
         ctx_ids = torch.nn.utils.rnn.pad_sequence(
@@ -142,4 +144,5 @@ def generation_collator(inp_list, tokenizer):
         out["ctx_attn_mask"] = ctx_attn_mask
 
         out["n_ctx_chunks"] = torch.tensor(n_chunks, dtype=torch.int32)
+
     return out

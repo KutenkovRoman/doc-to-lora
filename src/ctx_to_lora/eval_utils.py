@@ -587,7 +587,7 @@ def eval_generation(
             len_key = "ctx_ids_len" if "ctx_ids_len" in txt else "input_ids_len"
             input_len = txt[len_key]
             for low, high in LENGTH_BINS:
-                if low <= input_len <= high:
+                if low <= input_len < high:
                     group_key = f"{low}-{high}"
                     grouped_texts[group_key]["generated"].append(txt["generated"])
                     grouped_texts[group_key]["label"].append(txt["label"])
@@ -711,7 +711,8 @@ def evaluate(
     generative: bool,
 ) -> dict[str, dict]:
     """Main evaluation function."""
-    assert split in ["validation", "test"]
+    #assert split in ["validation", "test"]
+
     ctx_name = None
     model_kwargs = dict(attn_implementation="flash_attention_2")
 
@@ -738,12 +739,14 @@ def evaluate(
             use_sequence_packing=False,  # for generation
             user_defined_scaling=args.gen_lora_scaling,
         )
+
         if getattr(args, "use_llmlingua", False):
             print("Using LLMLingua-2 for compressing inp")
             inp_compressor = LLMLinguaModel(
                 model.base_model, tokenizer, args.llmlingua_compression_rate
             )
             model.inp_compressor = inp_compressor
+
         ctx_model_max_len = model.ctx_encoder.config.max_position_embeddings
         model.enable_iterative_mode(args.use_iterative_mode)
         add_tracker(model.base_model.generate, "generate")
@@ -803,6 +806,7 @@ def evaluate(
             add_tracker(model.generate_questions, "generate_questions")
             add_tracker(model.teacher_generate, "teacher_generate")
             add_tracker(model.student_generate, "student_generate")
+
         elif use_llmlingua := getattr(args, "use_llmlingua", False):
             model = LLMLinguaModel(
                 base_model, tokenizer, args.llmlingua_compression_rate
@@ -839,10 +843,10 @@ def evaluate(
             ctx_tokenizer.pad_token_id = ctx_tokenizer.eos_token_id
 
     add_ctx_to_chat = (
-        (isinstance(model, PreTrainedModel) and not args.remove_context)
-        or isinstance(model, CtxDistillModel)
-        or args.add_ctx_to_input
+        (isinstance(model, PreTrainedModel) and not args.remove_context) or
+        isinstance(model, CtxDistillModel) or args.add_ctx_to_input
     )
+    print("Added" if add_ctx_to_chat else "Did not add", "context to chat.")
 
     _get_tokenized_dataset = partial(
         get_tokenized_dataset,
@@ -873,12 +877,13 @@ def evaluate(
     ds_names = args.val_ds_names if split == "validation" else args.test_ds_names
     add_longbench_tasks(ds_names)
     for ds_name in ds_names:
-        datasets[ds_name] = _get_tokenized_dataset(ds_name, split)
+        datasets[ds_name] = _get_tokenized_dataset(ds_name, split, is_eval=True)
         # handling cases where there are multiple answers
         if ds_name in MULTI_ANSWER_DATASETS:
             answers[ds_name] = load_answers(ds_name, split)
-    print(f"Datasets: {datasets}")
-    print(f"Answers: {answers}")
+
+    #print(f"Datasets: {datasets}")
+    #print(f"Answers: {answers}")
 
     # truncating num val samples
     max_eval_samples_per_ds = getattr(args, "max_val_samples_per_ds", 0)
@@ -907,8 +912,8 @@ def evaluate(
                     test_indices
                 )
 
-    print(f"Datasets: {datasets}")
-    print(f"Answers: {answers}")
+    #print(f"Datasets: {datasets}")
+    #print(f"Answers: {answers}")
 
     gen_kwargs = dict(
         do_sample=False,
@@ -940,7 +945,7 @@ def evaluate(
     eval_trainer_args = Seq2SeqTrainingArguments(
         **eval_trainer_args,
         predict_with_generate=generative,
-        # generation_config=GenerationConfig(**gen_kwargs),
+        #generation_config=GenerationConfig(**gen_kwargs),
     )
 
     print("=" * 80 + "\n" + "Evaluating model..." + "\n" + "=" * 80)
@@ -951,7 +956,6 @@ def evaluate(
     collator = generation_collator if generative else eval_collator
 
     # if isinstance(model, CtxDistillModel):
-
     #     model.generate = partial(
     #         model.generate,
     #         ctx_inp_sep_seq=sep_seq,
@@ -1038,14 +1042,16 @@ def run_eval(
     flip_ctx_inp: bool = False,
     gen_lora_scaling: float = 1,
     use_generative_adapter: bool = False,
+    output_dir: str = None,
+    run_name: str = None,
 ) -> None:
     """Run evaluation with the specified parameters."""
     assert bool(model_name_or_path) ^ bool(checkpoint_path), (
         "Either --model_name_or_path or --checkpoint_path must be provided"
     )
+
     if (use_cd or use_llmlingua or use_t2l) and eval_batch_size != 1:
         raise ValueError("When using a baseline method, eval_batch_size must be 1.")
-
     if use_llmlingua and add_ctx_to_input:
         raise ValueError(
             "LLMLingua always adds compressed context to input by default."
@@ -1073,22 +1079,28 @@ def run_eval(
     torch.backends.cudnn.allow_tf32 = False
 
     slurm_job_id = f"_{os.getenv('SLURM_JOB_ID')}" if os.getenv("SLURM_JOB_ID") else ""
-    run_name = get_run_name(seed_str=time.strftime("%Y%m%d-%H%M%S") + slurm_job_id)
+    run_id = get_run_name(seed_str=time.strftime("%Y%m%d-%H%M%S") + slurm_job_id)
 
-    if checkpoint_path:
-        checkpoint_dir = "/".join(checkpoint_path.split("/")[:-1])
+    if checkpoint_path is not None:
+        #checkpoint_dir = "/".join(checkpoint_path.split("/")[:-1])
         run_dir = "/".join(checkpoint_path.split("/")[:-2])
         cur_it = int(checkpoint_path.split("checkpoint-")[1].split("/")[0])
         try:
             args = Namespace(**yaml.unsafe_load(open(f"{run_dir}/args.yaml")))
         except FileNotFoundError:
-            raise FileNotFoundError(f"Could not find args.yaml in {run_dir}. ")
+            raise FileNotFoundError(f"Could not find args.yaml in {run_dir}.")
         print(f"checkpoint_path: {checkpoint_path}")
         print(f"run_dir: {run_dir}")
 
-        args.output_dir = f"{run_dir}/eval-results-{cur_it}/{run_name}"
-        args.logging_dir = f"{run_dir}/eval-results-{cur_it}/{run_name}"
-        args.run_name = run_dir.split("/")[-1]
+        if run_name is None:
+            run_name = run_id
+
+        if output_dir is not None:
+            args.output_dir = args.logging_dir = f"{output_dir}/{run_name}"
+        else:
+            args.output_dir = args.logging_dir = f"{run_dir}/eval-results-{cur_it}/{run_name}"
+
+        args.run_name = run_dir.split("/")[-1]  # does not actual effect how runs are saved?
         # modulated model doesn't see ctx by default
         # but remove_context has to be false for correct file naming
         args.remove_context = False
@@ -1097,6 +1109,7 @@ def run_eval(
             args.use_llmlingua = use_llmlingua
             args.llmlingua_compression_rate = llmlingua_compression_rate
     else:
+        run_name = run_id  # temporary plug, mb fix later...
         args = Namespace(
             model_name_or_path=model_name_or_path,
             output_dir=f"eval_results/{model_name_or_path}/{run_name}",
@@ -1118,6 +1131,7 @@ def run_eval(
         if use_t2l:
             args.use_t2l = use_t2l
         args.use_generative_adapter = use_generative_adapter
+
     if max_val_samples_per_ds > 0:
         args.max_val_samples_per_ds = max_val_samples_per_ds
     if max_test_samples_per_ds > 0:

@@ -6,7 +6,10 @@ from transformers import Trainer
 from transformers.trainer_pt_utils import get_parameter_names
 from transformers.trainer_utils import IntervalStrategy
 
-from ctx_to_lora.modeling.hypernet import ModulatedPretrainedModel
+from ctx_to_lora.modeling.hypernet import (
+    ModulatedPretrainedModel,
+    USE_RANDOM_REPR,
+)
 
 logger = logging.getLogger()
 
@@ -100,9 +103,9 @@ class ModulatedModelTrainer(Trainer):
                 break
 
         count_num_items_in_batch = (
-            len(batch_samples) > 0
-            and "labels" in batch_samples[0]
-            and "n_ctx_chunks" in batch_samples[0]
+            len(batch_samples) > 0 and
+            "labels" in batch_samples[0] and
+            "n_ctx_chunks" in batch_samples[0]
         )
 
         if count_num_items_in_batch:
@@ -141,17 +144,15 @@ class DistillationTrainer(ModulatedModelTrainer):
         self.use_per_ctx_average_loss = kwargs.pop("use_per_ctx_average_loss", False)
         super().__init__(*args, **kwargs)
 
-    def compute_loss(
-        self, model, inputs, return_outputs=False, num_items_in_batch=None
-    ):
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         # NOTE: the loss output from this fn will be ***added***
-        # meaning that we should always scale the loss wrt `num_items_in_batch`
+        # meaning that we should always scale the loss w.r.t. `num_items_in_batch`
         # (average over the number of items in the accumulated batch)
 
         is_train = num_items_in_batch is not None
         labels = inputs.pop("labels", None)
         label_pos = torch.where(labels != -100)
-        outputs, (gen_loras, _) = model(**inputs, return_generated_lora=True)
+        outputs, generated_loras = model(**inputs, return_generated_lora=True)
 
         if "logprobs_vals" not in inputs:
             return (torch.tensor(0.0), outputs) if return_outputs else torch.tensor(0.0)
@@ -160,8 +161,8 @@ class DistillationTrainer(ModulatedModelTrainer):
         indices = inputs.pop("logprobs_indices").squeeze(0)
 
         assert label_pos[0].shape[0] == target_logp.shape[0], (
-            "Label positions and target log probabilities should have the same # tokens."
-            f"Got : {label_pos[0].shape[0]=} and {target_logp.shape[0]=}"
+            f"Label positions and target log probabilities should have the same # tokens. "
+            f"Got: {label_pos[0].shape[0] = } and {target_logp.shape[0] = }"
         )
 
         ##### KL loss
@@ -185,12 +186,12 @@ class DistillationTrainer(ModulatedModelTrainer):
             loss = per_ctx_loss_kl(inputs, labels, loss)
 
         if is_train:
-            if self.use_per_ctx_average_loss:
-                loss = loss.sum() / num_items_in_batch["ctx"]
-            else:
-                loss = loss.sum() / num_items_in_batch["labels"]
-        else:
-            # eval
+            loss = loss.sum() / (
+                num_items_in_batch["ctx"]
+                if self.use_per_ctx_average_loss
+                else num_items_in_batch["labels"]
+            )
+        else: # eval
             loss = loss.mean()
 
         # if reduction == "batchmean":
@@ -207,10 +208,11 @@ class DistillationTrainer(ModulatedModelTrainer):
 
         ##### unpack gen lora dict and compute regularization loss
         l1_norm = 0
-        n_modules = len(gen_loras)
-        for module, lora in gen_loras.items():
+        n_modules = len(generated_loras)
+        for _, lora in generated_loras.items():
             l1_norm += lora["A"].abs().sum(0).mean() + lora["B"].abs().sum(0).mean()
         l1_norm /= n_modules
+
         if is_train:
             # during eval `num_items_in_batch` will be None
             l1_norm /= num_items_in_batch["ctx"]
@@ -224,17 +226,18 @@ class DistillationTrainer(ModulatedModelTrainer):
             scaler *= self.accelerator.num_processes
 
         # rough estimate of the losses (we only log the values from one step)
-        if (self.state.global_step == 1 and self.args.logging_first_step) or (
-            self.args.logging_strategy == IntervalStrategy.STEPS
-            and self.state.global_step % self.state.logging_steps == 0
+        if (
+            (self.state.global_step == 1 and self.args.logging_first_step) or
+            (
+                self.args.logging_strategy == IntervalStrategy.STEPS and
+                self.state.global_step % self.state.logging_steps == 0
+            )
         ):
             # compensate `num_items_in_batch` division
-            self.log(
-                {
-                    "kl_loss": loss.item() * scaler,
-                    "gen_lora_l1_norm": l1_norm.item() * scaler,
-                }
-            )
+            self.log({
+                "kl_loss": loss.item() * scaler,
+                "gen_lora_l1_norm": l1_norm.item() * scaler,
+            })
 
         return (total_loss, outputs) if return_outputs else total_loss
 
@@ -286,7 +289,7 @@ class CrossEntropyTrainer(ModulatedModelTrainer):
 
         is_train = num_items_in_batch is not None
         labels = inputs.pop("labels", None)
-        outputs, (gen_loras, _) = model(**inputs, return_generated_lora=True)
+        outputs, generated_weights = model(**inputs, return_generated_lora=True)
         # [1, tot_seq_len]
         logits = outputs.logits
 
@@ -297,12 +300,12 @@ class CrossEntropyTrainer(ModulatedModelTrainer):
             loss = per_ctx_loss_ce(inputs, labels, loss)
 
         if is_train:
-            if self.use_per_ctx_average_loss:
-                loss = loss.sum() / num_items_in_batch["ctx"]
-            else:
-                loss = loss.sum() / num_items_in_batch["labels"]
-        else:
-            # eval
+            loss = loss.sum() / (
+                num_items_in_batch["ctx"]
+                if self.use_per_ctx_average_loss
+                else num_items_in_batch["labels"]
+            )
+        else: # eval
             loss = loss.mean()
 
         #####
@@ -347,11 +350,113 @@ class CrossEntropyTrainer(ModulatedModelTrainer):
         #####
 
         ##### unpack gen lora dict and compute regularization loss
+        if USE_RANDOM_REPR:
+            l1_norm = generated_weights.abs().sum(0).mean()
+        else:
+            l1_norm = 0
+            n_modules = len(generated_weights)
+            for _, lora in generated_weights.items():
+                l1_norm += lora["A"].abs().sum(0).mean() + lora["B"].abs().sum(0).mean()
+            l1_norm /= n_modules
+
+        if is_train:
+            # during eval `num_items_in_batch` will be None
+            l1_norm /= num_items_in_batch["ctx"]
+
+        total_loss = loss + self.gen_lora_l1_reg_coef * l1_norm
+        #####
+
+        scaler = self.args.gradient_accumulation_steps if is_train else 1.0
+        if self.args.average_tokens_across_devices and is_train:
+            total_loss *= self.accelerator.num_processes
+            scaler *= self.accelerator.num_processes
+
+        # rough estimate of the losses (we only log the values from one step)
+        if (
+            (self.state.global_step == 1 and self.args.logging_first_step) or
+            (
+                self.args.logging_strategy == IntervalStrategy.STEPS and
+                self.state.global_step % self.state.logging_steps == 0
+            )
+        ):
+            # compensate `num_items_in_batch` division
+            self.log({
+                "ce_loss": loss.item() * scaler,
+                "gen_lora_l1_norm": l1_norm.item() * scaler,
+            })
+
+        return (total_loss, outputs) if return_outputs else total_loss
+
+
+class MixedDistillationTrainer(ModulatedModelTrainer):
+    def __init__(self, *args, **kwargs):
+        self.gen_lora_l1_reg_coef = kwargs.pop("gen_lora_l1_reg_coef", 0.0)
+        self.use_per_ctx_average_loss = kwargs.pop("use_per_ctx_average_loss", False)
+        self.alpha = 0.7
+        self.temperature = 1.0
+        super().__init__(*args, **kwargs)
+
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        # NOTE: the loss output from this fn will be ***added***
+        # meaning that we should always scale the loss w.r.t. `num_items_in_batch`
+        # (average over the number of items in the accumulated batch)
+
+        is_train = num_items_in_batch is not None
+        labels = inputs.pop("labels", None)
+        label_pos = torch.where(labels != -100)
+        outputs, generated_loras = model(**inputs, return_generated_lora=True)
+
+        if "logprobs_vals" not in inputs:
+            return (torch.tensor(0.0), outputs) if return_outputs else torch.tensor(0.0)
+
+        target_logp = inputs.pop("logprobs_vals").squeeze(0)
+        indices = inputs.pop("logprobs_indices").squeeze(0)
+
+        assert label_pos[0].shape[0] == target_logp.shape[0], (
+            f"Label positions and target log probabilities should have the same # tokens. "
+            f"Got: {label_pos[0].shape[0] = } and {target_logp.shape[0] = }"
+        )
+
+        ##### KL loss
+        shifted_logits = outputs.logits[label_pos[0], label_pos[1] - 1]  # shift back 1
+
+        logq_full_denom = torch.logsumexp(shifted_logits, dim=-1, keepdim=True)  # (N,1)
+        selected_logits = shifted_logits.gather(1, indices)  # (N,K)
+        # log softmax at selected indices
+        logq_selected = selected_logits - logq_full_denom
+        p = target_logp.exp() * (self.temperature ** 2)
+        kd_loss = -(p * logq_selected).sum(dim=-1)
+
+        ##### CE loss
+        logits = outputs.logits
+
+        ce_loss = causal_lm_ce_loss(logits, labels, self.model.vocab_size)
+
+        if self.use_per_ctx_average_loss:
+            kl_loss = per_ctx_loss_kl(inputs, labels, kl_loss)
+            ce_loss = per_ctx_loss_ce(inputs, labels, ce_loss)
+
+        if is_train:
+            divisor = (
+                num_items_in_batch["ctx"]
+                if self.use_per_ctx_average_loss
+                else num_items_in_batch["labels"]
+            )
+            kl_loss = kl_loss.sum() / divisor
+            ce_loss = ce_loss.sum() / divisor
+        else: # eval
+            kl_loss = kl_loss.mean()
+            ce_loss = ce_loss.mean()
+
+        loss = self.alpha * kd_loss + (1 - self.alpha) * ce_loss
+
+        ##### unpack gen lora dict and compute regularization loss
         l1_norm = 0
-        n_modules = len(gen_loras)
-        for module, lora in gen_loras.items():
+        n_modules = len(generated_loras)
+        for _, lora in generated_loras.items():
             l1_norm += lora["A"].abs().sum(0).mean() + lora["B"].abs().sum(0).mean()
         l1_norm /= n_modules
+
         if is_train:
             # during eval `num_items_in_batch` will be None
             l1_norm /= num_items_in_batch["ctx"]
@@ -365,17 +470,19 @@ class CrossEntropyTrainer(ModulatedModelTrainer):
             scaler *= self.accelerator.num_processes
 
         # rough estimate of the losses (we only log the values from one step)
-        if (self.state.global_step == 1 and self.args.logging_first_step) or (
-            self.args.logging_strategy == IntervalStrategy.STEPS
-            and self.state.global_step % self.state.logging_steps == 0
+        if (
+            (self.state.global_step == 1 and self.args.logging_first_step) or
+            (
+                self.args.logging_strategy == IntervalStrategy.STEPS and
+                self.state.global_step % self.state.logging_steps == 0
+            )
         ):
             # compensate `num_items_in_batch` division
-            self.log(
-                {
-                    "ce_loss": loss.item() * scaler,
-                    "gen_lora_l1_norm": l1_norm.item() * scaler,
-                }
-            )
+            self.log({
+                "kl_loss": kd_loss.item() * scaler,
+                "ce_loss": ce_loss.item() * scaler,
+                "gen_lora_l1_norm": l1_norm.item() * scaler,
+            })
 
         return (total_loss, outputs) if return_outputs else total_loss
 
@@ -419,8 +526,9 @@ def train_model(
         compute_metrics=compute_metrics,
     )
 
-    is_modulated_model = isinstance(model, ModulatedPretrainedModel)
     trainer_cls = Trainer
+    is_modulated_model = isinstance(model, ModulatedPretrainedModel)
+
     if is_modulated_model:
         logger.info("Training with modulated model.")
         trainer_cls = CrossEntropyTrainer
@@ -434,6 +542,7 @@ def train_model(
         if training_args.use_kl_loss:
             logger.info("Training with distillation loss. Using DistillationTrainer.")
             trainer_cls = DistillationTrainer
+            # trainer_cls = MixedDistillationTrainer
             del training_args.use_kl_loss
 
     if training_args.auto_find_batch_size:
@@ -448,8 +557,7 @@ def train_model(
     # MONKEY PATCH: remove embedding layers from weight decay
     trainer.get_decay_parameter_names = get_decay_parameter_names
 
-    # Trainer loads the best model after training
-    # is done when load_best_model_at_end=True
+    # Trainer loads the best model after training, when load_best_model_at_end=True
     train_result = trainer.train(resume_from_checkpoint=checkpoint)
     trainer.log_metrics("train", train_result.metrics)
     trainer.save_model()

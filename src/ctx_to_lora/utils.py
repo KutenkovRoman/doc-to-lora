@@ -75,7 +75,7 @@ def log_num_train_params(model):
     logger.info(
         f"trainable params: {num_trainable_params:,d} "
         f"|| all params: {num_total_params:,d} "
-        f"|| trainable%: {100 * num_trainable_params / num_total_params:.4f}"
+        f"|| trainable: {100 * num_trainable_params / num_total_params:.4f}%"
     )
 
 
@@ -165,9 +165,11 @@ def get_peft_modules(model: PeftModel, peft_config: PeftConfig) -> list[dict[str
     return [
         {"name": name, "module": module}
         for name, module in model.named_modules()
-        if name.split(".")[-1] in peft_config.target_modules
-        and isinstance(module, BaseTunerLayer)
-        and check_target_module_exists(peft_config, name)
+        if (
+            name.split(".")[-1] in peft_config.target_modules and
+            isinstance(module, BaseTunerLayer) and
+            check_target_module_exists(peft_config, name)
+        )
     ]
 
 

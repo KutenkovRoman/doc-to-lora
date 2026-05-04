@@ -1,38 +1,28 @@
 import argparse
 import os
-import random
 import re
-from glob import glob
 
 import numpy as np
 import yaml
-from datasets import Dataset, load_dataset
+from datasets import Dataset  #load_dataset
 from vllm import LLM, SamplingParams
 
-from ctx_to_lora.data.definitions import (
-    CLOSED_QA_INTX_TEMPLATES,
-    RAW_DATA_DIR,
-    SELF_GEN_DATA_DIR,
-)
+import sys
+sys.path.append("src")  # complains that there is no module ctx_to_lora without this
+
+from ctx_to_lora.data.definitions import SELF_GEN_DATA_DIR
 from ctx_to_lora.data.processing import (
     filter_none,
-    get_preprocessing_fn,
     load_and_process_dataset,
     tokenize_ctx_text,
 )
 from ctx_to_lora.data.self_gen_template import (
-    PRE_CTX,
-    PROMPT_TEMPLATE,
-    QA_PROMPT_TEMPLATE,
     SELF_GEN_SYSTEM_MSG,
     SELF_QA_INTX,
 )
 from ctx_to_lora.model_loading import get_tokenizer
 from ctx_to_lora.utils import clear_gpu
 
-STOP_STRINGS = {
-    "google/gemma-2-2b-it": ["<eos>", "<end_of_turn>"],
-}
 
 MODEL_CTX_LEN = {
     "google/gemma-2-27b-it": 8192,
@@ -64,17 +54,6 @@ def truncate_middle_if_too_long(
     if len(input_ids) > max_length:
         return input_ids[:half] + input_ids[-half:]
     return input_ids
-
-
-def get_prompt(context: str, q: str, remove_qa_template: bool) -> str:
-    prompt = QA_PROMPT_TEMPLATE if not remove_qa_template else PROMPT_TEMPLATE
-    return prompt.format(context=context, question=q)
-
-
-def add_closed_qa_prompt(q: str, closed_qa_prob: float = 0.1) -> str:
-    if random.random() <= closed_qa_prob:
-        q = random.choice(CLOSED_QA_INTX_TEMPLATES).format(input=q)
-    return q
 
 
 def load_config(config_path: str) -> dict:
@@ -131,47 +110,12 @@ def get_dataset_configs(
         return dataset_configs
 
 
-def create_messages(
-    ctxs: list[str],
-    questions: list[list[str]],
-    vllm_model: str,
-    system_template: str,
-    remove_qa_template: bool,
-) -> list[list[dict]]:
-    """Create chat messages for the model."""
-    # if "gemma" in vllm_model:
-    # gemma models do not support system messages
-    return [
-        [
-            {
-                "role": "user",
-                "content": (
-                    system_template + "\n\n\n" + get_prompt(ctx, q, remove_qa_template)
-                ).strip(),
-            }
-        ]
-        for ctx, q_list in zip(ctxs, questions)
-        for q in q_list
-    ]
-
-    # return [
-    #     [
-    #         {"role": "system", "content": system_template},
-    #         {"role": "user", "content": get_prompt(ctx, q, remove_qa_template)},
-    #     ]
-    #     for ctx, q_list in zip(ctxs, questions)
-    #     for q in q_list
-    # ]
-
-
 def self_generate(
     ds_name: str,
     split: str,
     args: argparse.Namespace,
     llm: LLM,
     system_template: str,
-    parquet_file: str | None = None,
-    do_truncate: bool = False,
 ) -> None:
     """Process a single dataset and generate QA pairs."""
 
@@ -184,14 +128,9 @@ def self_generate(
             raise ValueError(
                 f"Multiple sources of truth for temperature: CLI arg --temp={args.temp} and dataset name contains temp specification."
             )
-        if "_closed_qa_prob_" in ds_name and args.closed_qa_prob != 0.0:
-            raise ValueError(
-                f"Multiple sources of truth for closed_qa_prob: CLI arg --closed_qa_prob={args.closed_qa_prob} and dataset name contains closed_qa_prob specification."
-            )
 
-    # Base values from args
+    # Base values from args (ditched closed_qa_prob parameter)
     temp = args.temp
-    closed_qa_prob = args.closed_qa_prob
 
     # Overrides from ds_name pattern if present
     if ds_name is not None:
@@ -199,116 +138,72 @@ def self_generate(
             m = re.search(r"_temp_([\d.]+)", ds_name)
             if m:
                 temp = float(m.group(1))
-        if "_closed_qa_prob_" in ds_name:
-            m = re.search(r"_closed_qa_prob_([\d.]+)", ds_name)
-            if m:
-                closed_qa_prob = float(m.group(1))
 
     print(f"Processing dataset: {ds_name}, split: {split}")
     print(f"Using temperature: {temp}")
-    print(f"Using closed QA prompt probability: {closed_qa_prob}")
 
-    if parquet_file:
-        print(f"Loading dataset from parquet file: {parquet_file}")
+    ds_name = ds_name.split("/")[-1]  # Extract just the dataset name
 
-        split = "train"
-        ds_name = "/".join(parquet_file.split(RAW_DATA_DIR)[-1].split("/")[:-1])
+    print(f"Loading dataset: {ds_name} with split: {split}")
 
-        shard_name = "_" + os.path.basename(parquet_file).replace(".parquet", "")
-        ds = load_dataset(path="parquet", data_files=[parquet_file], split="train")
-        processing_fn = get_preprocessing_fn(ds_name, is_eval=False)
-        ds = ds.map(processing_fn, num_proc=8)
-
-    else:
-        ds_name = ds_name.split("/")[-1]  # Extract just the dataset name
-
-        print(f"Loading dataset: {ds_name} with split: {split}")
-        #kwargs = dict(ds_name=ds_name, split=split)  # what is the purpose of putting it in dict?
-
-        ds = load_and_process_dataset(
-            ds_name,
-            split,
-            is_eval=True,  # To add instruction
-            add_negative_prompt=False,
-            num_proc=8,
-            remove_cols=False,
-        )
+    num_proc = 4
+    # At this point we have columns: 'context', 'prompts' (with appropriate intx), 'responses'
+    ds = load_and_process_dataset(
+        ds_name,
+        split,
+        is_eval=True,  # To add instruction
+        add_negative_prompt=False,
+        num_proc=num_proc,
+    )
     print(f"Loaded dataset: {ds_name} with split: {split}")
 
-    if args.debug:
-        ds = ds.take(10)
+    ds = ds.filter(filter_none, batched=False, num_proc=num_proc)
 
-    ds = ds.filter(filter_none, batched=False, num_proc=8)
+    tokenizer = get_tokenizer(args.vllm_model, train=True)
 
-    tk = get_tokenizer(args.vllm_model, train=True)
+    self_qa_intx_tokens = tokenizer(" \n\n", add_special_tokens=False)["input_ids"]
 
-    self_qa_intx_tokens = tk(SELF_QA_INTX, add_special_tokens=False)["input_ids"][1:]
-    if args.remove_qa_template:
-        self_qa_intx_tokens = tk("\n\n", add_special_tokens=False)["input_ids"]
-    n_self_qa_intx_tokens = len(self_qa_intx_tokens)
-    #pre_ctx_tokens = tk(PRE_CTX, add_special_tokens=False)["input_ids"] # not used
-    #n_pre_ctx_tokens = len(pre_ctx_tokens)  # not used
-    sys_tokens = tk(system_template.split("\n")[0], add_special_tokens=False)[
-        "input_ids"
-    ][:-1]
-    n_sys_tokens = len(sys_tokens)
     os.environ["TOKENIZERS_PARALLELISM"] = "true"
+    # After this we have new column 'ctx_ids' with tokenized contexts
     ds = ds.map(
         tokenize_ctx_text,
-        fn_kwargs={"tokenizer": tk},
+        fn_kwargs={"tokenizer": tokenizer},
         batched=True,
         batch_size=50_000,
         keep_in_memory=True,
     )
 
-    ctxs = [sample["context"] for sample in ds]
-    questions = [
-        [add_closed_qa_prompt(q, closed_qa_prob) for q in sample["prompts"] if q]
-        for sample in ds
-    ]
-
-    # What is the point of definition above???
-    questions = [q_list for q_list in ds["prompts"] if len(q_list) > 0]
+    # ctxs = [sample["context"] for sample in ds]
+    # questions = [q_list for q_list in ds["prompts"] if len(q_list) > 0]
+    ctxs, questions = ds["context"], ds["prompts"]
 
     print(f"Loaded {len(ctxs)} contexts and {len(questions)} questions")
 
-    k = 16
-    fpath = f"{SELF_GEN_DATA_DIR}/{args.vllm_model}_temp_{temp}_closed_qa_prob_{closed_qa_prob}/{ds_name}/{split}/ds{shard_name}"
-
+    # fpath = f"{SELF_GEN_DATA_DIR}/qwen3-4b-instruct/{ds_name}/{split}/ds{shard_name}"
+    fpath = f"{SELF_GEN_DATA_DIR}/gemma-2-2b-it/{ds_name}/{split}/ds{shard_name}"
     chunk_size = 1_000
+
     for chunk_idx, start in enumerate(range(0, len(ctxs), chunk_size)):
         print(f"Processing chunk {chunk_idx}")
 
         chunk_ctxs = ctxs[start:(start + chunk_size)]
         chunk_questions = questions[start:(start + chunk_size)]
-        chunk_messages = create_messages(
-            chunk_ctxs,
-            chunk_questions,
-            args.vllm_model,
-            SELF_GEN_SYSTEM_MSG,  # should be `system_template`?
-            args.remove_qa_template,
-        )
 
-        if do_truncate:
-            # we should only do this for evaluation data
-            tokenized_contents = tk(
-                [m[0]["content"] for m in chunk_messages],
-                add_special_tokens=False,
-                return_attention_mask=False,
-            )
-            tokenized_contents["input_ids"] = [
-                truncate_middle_if_too_long(
-                    ids,
-                    max_length=MODEL_CTX_LEN[args.vllm_model],
-                    max_new_tokens=args.max_new_tokens,
-                )
-                for ids in tokenized_contents["input_ids"]
+        chunk_ctx_ids = ds[start:(start + chunk_size)]["ctx_ids"]
+        chunk_answers = ds[start:(start + chunk_size)]["responses"]
+
+        chunk_messages = [
+            [
+                {
+                    "role": "user",
+                    # Qwen tokenizer parses ".\n\n" as a separate token, probably does
+                    # same shit with other combos...
+                    "content": (ctx.rstrip() + " \n\n" + q).strip(),
+                }
             ]
-            contents = tk.batch_decode(
-                tokenized_contents["input_ids"], skip_special_tokens=True
-            )
-            for c, m in zip(contents, chunk_messages):
-                m[0]["content"] = c
+            for ctx, q_list in zip(chunk_ctxs, chunk_questions)
+            for q in q_list  # for babilong q_list always has 1 element
+        ]
 
         print(f"Generating from {len(chunk_messages)} contexts")
 
@@ -319,16 +214,12 @@ def self_generate(
             args,
             llm,
             temp,
-            tk,
+            tokenizer,
             self_qa_intx_tokens,
-            n_self_qa_intx_tokens,
-            sys_tokens,
-            n_sys_tokens,
             chunk_ctxs,
-            ds[start:(start + chunk_size)]["ctx_ids"],
-            chunk_questions,
+            chunk_ctx_ids,
+            chunk_answers,
             chunk_messages,
-            k,
         )
 
 
@@ -337,17 +228,19 @@ def execute_qa_generation(
     args,
     llm,
     temp,
-    tk,
+    tokenizer,
     self_qa_intx_tokens,
-    n_self_qa_intx_tokens,
-    sys_tokens,
-    n_sys_tokens,
     ctxs,
     ctx_ids,
-    questions,
+    answers,
     messages,
-    k,
 ):
+    valid_answers = [
+        "bathroom", "bedroom", "garden", "hallway", "kitchen", "office"
+    ]
+    k = len(valid_answers)
+    n_self_qa_intx_tokens = len(self_qa_intx_tokens)
+
     completions = llm.chat(
         messages,
         sampling_params=SamplingParams(
@@ -373,14 +266,64 @@ def execute_qa_generation(
     }
     c = 0
     n_skips = 0
-    sys_start = None
-    for ctx, q_list in zip(ctxs, questions):
-        # self_gen_data[ctx]["ctx_ids"] = ctx_ids
-        for i, _ in enumerate(q_list):
-            # response = completions[c + i].outputs[0].text
+
+    # qwen tokenizer encodes differently depending on position in a sequence, but I tested
+    # and it should be fine...
+    # offset by 1 for gemma tokenizer
+    valid_answer_tokens = [tokenizer.encode(answer)[1:] for answer in valid_answers]
+    valid_answer_start_tokens = [tokens[0] for tokens in valid_answer_tokens]
+
+    _valid_answer_tokens = [tokenizer.encode(answer[0].upper() + answer[1:])[1:] for answer in valid_answers]
+    _valid_answer_start_tokens = [tokens[0] for tokens in _valid_answer_tokens]
+
+    for answer, tokens in zip(valid_answers, valid_answer_tokens):
+        print(answer, '->', tokens)
+
+    # MONKEY PATCH
+    assert k == 6 and all(len(tokens) <= 2 for tokens in valid_answer_tokens)
+
+    # valid_start_permutation = [  # input ids for qwen
+    #     [65, 2721, 70, 42241, 74, 26516],  # bathroom
+    #     [2721, 70, 42241, 74, 26516, 65],  # bedroom
+    #     [70, 42241, 74, 26516, 65, 2721],  # garden
+    #     [42241, 74, 26516, 65, 2721, 70],  # hallway
+    #     [74, 26516, 65, 2721, 70, 42241],  # kitchen
+    #     [26516, 65, 2721, 70, 42241, 74],  # office
+    # ]
+    # filler_logprob_indices = [  # input ids for qwen
+    #     [77832,  587,  43561, 17169,  6207, 24736],  # bathroom
+    #     [2966,   9750, 10721,  8719,  4191, 50670],  # bedroom
+    #     [8341,  23118,  567,  45296, 14556, 13551],  # garden
+    #     [3117,  41803,  2284, 26798,  1616, 24723],  # hallway
+    #     [7454,  48621, 28324,  9780,  1610,  9400],  # kitchen
+    #     # office does not need it since it is a 1 token
+    #     [151645, 11162, 334, 198, 25521, 13],  # <|im_end|>
+    # ]
+
+    valid_start_permutation = [  # input ids for gemma
+        [110277,  62083,  49186,  16810,  56745,  26878],  # bathroom
+        [ 62083,  49186,  16810,  56745,  26878, 110277],  # bedroom
+        [ 49186,  16810,  56745,  26878, 110277,  62083],  # garden
+        [ 16810,  56745,  26878, 110277,  62083,  49186],  # hallway
+        [ 56745,  26878, 110277,  62083,  49186,  16810],  # kitchen
+        [ 26878, 110277,  62083,  49186,  16810,  56745],  # office
+    ]
+    filler_logprob_indices = [  # input ids for gemma
+        # this time only hallway consists of 2 tokens...
+        [235248, 107, 1, 108, 139, 235265],  # bathroom
+        [235248, 107, 1, 108, 139, 235265],  # bedroom
+        [235248, 107, 1, 108, 139, 235265],  # garden
+        [1677, 65041, 51686, 2095, 108, 235248],  # hallway
+        [235248, 107, 1, 108, 139, 235265],  # kitchen
+        [235248, 107, 1, 108, 139, 235265],  # office
+    ]
+
+    cnt = 0
+    uppercase = 0
+    for ctx, a_list in zip(ctxs, answers):
+        for i, answer in enumerate(a_list):
             reason = completions[c + i].outputs[0].finish_reason
             if reason != "stop":
-                # print(f"idx: {c + i}")
                 print(f"finish_reason: {completions[c + i].outputs[0].finish_reason}")
                 print(f"Skipping due to finish_reason={reason} != 'stop'")
                 n_skips += 1
@@ -412,28 +355,100 @@ def execute_qa_generation(
             res_start = len(prompt_ids)
             res_end = res_start + n_response_tokens
 
-            if sys_start is None:
-                for ii in range(len(prompt_ids) - n_sys_tokens):
-                    if prompt_ids[ii : ii + n_sys_tokens] == sys_tokens:
-                        # found the start of the system message
-                        sys_start = ii
-                        break
-
             q_start = None
-            for ii in range(len(prompt_ids) - n_self_qa_intx_tokens, -1, -1):
-                if prompt_ids[ii : ii + n_self_qa_intx_tokens] == self_qa_intx_tokens:
+            for j in range(len(prompt_ids) - n_self_qa_intx_tokens, -1, -1):
+                if prompt_ids[j:(j + n_self_qa_intx_tokens)] == self_qa_intx_tokens:
                     # found the start of the user input
-                    q_start = ii + n_self_qa_intx_tokens
+                    q_start = j + n_self_qa_intx_tokens
                     break
 
+            # For debug; will crush anyway if it activates
+            if q_start is None:
+                print(prompt_ids)
+
             # bos + question + eos + start model turn + response + eos
-            input_ids = all_ids[:sys_start] + all_ids[q_start:res_end]
+            input_ids = all_ids[q_start:res_end]
 
             # relative to the input_ids
-            res_start = res_start - q_start + sys_start
+            res_start = res_start - q_start
             res_end = res_start + n_response_tokens
 
             # arrays will be saved as nested lists of numbers
+
+            answer_idx = valid_answers.index(answer)
+            suffix_len = 3  # 1 for qwen
+
+            if input_ids[res_start] in _valid_answer_start_tokens:
+                # if uppercase < 3:
+                #     print(tokenizer.decode(input_ids))
+                #     print(f"start={res_start}, end={res_end}")
+                #     print(f"response={tokenizer.decode(input_ids[res_start:res_end])}")
+                #     for j in range(len(logp_vals)):
+                #         print(f"logprob_vals[{j}]={logp_vals[j]}")
+                #         print(f"logprobs_indices[{j}]={logp_indices[j]}")
+                #         print("=" * 80)
+
+                token = valid_answer_start_tokens[
+                    _valid_answer_start_tokens.index(input_ids[res_start])
+                ]
+                input_ids[res_start] = token
+
+                if token in logp_indices[0]:
+                    # swap if needed
+                    logp_indices[0, logp_indices[0] == token] = logp_indices[0, 0]
+                logp_indices[0, 0] = token
+
+                uppercase += 1
+
+            # redistribute probability if the most probable response is not a valid answer
+            # and (kind of) force true answer
+            # if not any(
+            #     input_ids[res_start:(res_end - 1)] == sequence
+            #     for sequence in valid_answer_tokens
+            # ):
+            if input_ids[res_start:(res_end - suffix_len)] != valid_answer_tokens[answer_idx]:
+                cnt += 1
+                epsilon = 1e-9  # rest of probability mass (except for valid answers)
+                input_ids = (
+                    input_ids[:res_start] +
+                    valid_answer_tokens[answer_idx] +
+                    input_ids[(res_end - suffix_len):res_end]
+                )
+                logp_vals = np.array(
+                    # probability for first token is uniform across valid answers
+                    # [[np.log((1 - epsilon) / k)] * k] +
+                    [
+                        [  # twice as much probability for true answer
+                            np.log((2 if j == 0 else 1) * (1 - epsilon) / (k + 1))
+                            for j in range(k)
+                        ]
+                    ] + (
+                        # enforcement of true answer + eos token
+                        [
+                            [
+                                np.log(1 - epsilon if j == 0 else epsilon / (k - 1))
+                                for j in range(k)
+                            ]
+                        ] * (len(valid_answer_tokens[answer_idx]) + suffix_len - 1)
+                    ),
+                    dtype=np.float16
+                )
+                logp_indices = np.concatenate(
+                    (
+                        np.array(
+                            [valid_start_permutation[answer_idx]] + (
+                                [filler_logprob_indices[answer_idx]]
+                                # if answer_idx != 5  # answer is not "office" for qwen
+                                if answer_idx == 3  # answer is "hallway" for gemma
+                                else []
+                            ),
+                            dtype=np.int32
+                        ),
+                        logp_indices[-suffix_len:, :],
+                    ),
+                    axis=0,
+                )
+                res_end = res_start + len(valid_answer_tokens[answer_idx]) + suffix_len
 
             self_gen_data[ctx]["input_ids"].append(input_ids)
             # assume single-turn chat
@@ -444,55 +459,60 @@ def execute_qa_generation(
         c += i + 1
 
     print(f"Skipped {n_skips} responses due to missing stop strings")
+    print(f"Modified {cnt} samples with {uppercase} being in upper case")
     samples = [
         {
-            # "context": ctx,
-            # "prompts": q_list,
-            # "responses": self_gen_data[ctx]["responses"],
             "ctx_ids": self_gen_data[ctx]["ctx_ids"],
             "input_ids": self_gen_data[ctx]["input_ids"],
             "response_start_end": self_gen_data[ctx]["response_start_end"],
-            # "prompt_start_end": self_gen_data[ctx]["prompt_start_end"],
             "logprobs_vals": self_gen_data[ctx]["logprobs_vals"],
             "logprobs_indices": self_gen_data[ctx]["logprobs_indices"],
         }
-        for ctx, q_list in zip(ctxs, questions)
+        for ctx in ctxs
     ]
 
+    # stats = {token: 0 for token in valid_answer_start_tokens}
+    cnt = 0
+    print("=" * 80)
     for i, sample in enumerate(samples):
-        if args.debug or i < 3:
-            print(f"QA={[tk.decode(ids) for ids in sample['input_ids']]}")
+        if args.debug:
+            print(f"QA={[tokenizer.decode(ids) for ids in sample['input_ids']]}")
 
             for input_ids, (start, end) in zip(
                 sample["input_ids"], sample["response_start_end"]
             ):
                 print(f"start={start}, end={end}, tokens=[{input_ids[start]}, {input_ids[start + 1]}, ...]")
-                print(f"response={tk.decode(input_ids[start:end])}")
+                print(f"response={tokenizer.decode(input_ids[start:end])}")
 
             print(f"logprobs_vals={[x.shape for x in sample['logprobs_vals']]}")
             print(f"logprobs_indices={[x.shape for x in sample['logprobs_indices']]}")
             for logprobs, indices in zip(
                 sample["logprobs_vals"], sample["logprobs_indices"]
             ):
-                print(f"logprob_vals[0]={logprobs[0]}")
-                print(f"logprobs_indices[0]={indices[0]}")
-            print("=" * 80)
+                for i in range(len(logprobs)):
+                    print(f"logprob_vals[{i}]={logprobs[i]}")
+                    print(f"logprobs_indices[{i}]={indices[i]}")
+                print("=" * 80)
 
         for input_ids, (start, end), logprobs, indices in zip(
             sample["input_ids"], sample["response_start_end"],
             sample["logprobs_vals"], sample["logprobs_indices"]
         ):
-            if input_ids[start] in [785, 1782]:
-                print(f"response={tk.decode(input_ids)}")
-                print(f"logprob_vals[0]={logprobs[0]}")
-                print(f"logprobs_indices[0]={indices[0]}")
+            if input_ids[start] not in valid_answer_start_tokens:  #and stats[input_ids[start]] < 3
+                # stats[input_ids[start]] += 1
+                cnt += 1
+                print(f"response={tokenizer.decode(input_ids[start:end])}")
+                print(f"logprob_vals[-2]={logprobs[-2]}")
+                print(f"logprobs_indices[-2]={indices[-2]}")
+                print(f"logprob_vals[-1]={logprobs[-1]}")
+                print(f"logprobs_indices[-1]={indices[-1]}")
+                print("=" * 80)
 
+    print(f"Incorrect answers: {cnt}")
     print(f"Generated {len(samples)} samples")
-    # random.shuffle(samples)
 
     # Save results
     ds_out = Dataset.from_list(samples)
-    # fpath = f"{SELF_GEN_DATA_DIR}/{args.vllm_model}_temp_{temp}_closed_qa_prob_{closed_qa_prob}/{ds_name}/{split}/ds{shard_name}"
 
     if args.debug:
         fpath += "_debug"
@@ -503,7 +523,7 @@ def execute_qa_generation(
     print(f"Saved to {fpath}")
 
     # Cleanup
-    del samples, ds_out, completions, messages, ctxs, questions
+    del samples, ds_out, completions, messages, ctxs, answers
     clear_gpu()
 
 
@@ -557,11 +577,11 @@ def parse_args() -> argparse.Namespace:
         default=0.0,
         help="Probability of using closed QA prompt template (default: 0.0)",
     )
-    parser.add_argument(
-        "--do_truncate",
-        action="store_true",
-        help="Truncate contexts to fit model context length",
-    )
+    # parser.add_argument(
+    #     "--do_truncate",
+    #     action="store_true",
+    #     help="Truncate contexts to fit model context length",
+    # )
     parser.add_argument(
         "--remove_qa_template",
         action="store_true",
@@ -602,32 +622,14 @@ if __name__ == "__main__":
 
     # Get dataset configs from config or CLI args
     config = load_config(args.config) if args.config else None
-    if args.ds_names or args.config:
-        dataset_configs = get_dataset_configs(
-            ds_names=args.ds_names,
-            config=config,
-            split=args.split,
-        )
 
-        # Process each dataset
-        for ds_name, split in dataset_configs:
-            print(f"Processing dataset: {ds_name}, split: {split}")
-            self_generate(
-                ds_name, split, args, llm, SELF_GEN_SYSTEM_MSG, None, args.do_truncate
-            )
-    else:
-        assert args.glob_pattern, (
-            "glob_pattern must be provided if no ds_names or config"
-        )
-        files = glob(args.glob_pattern)
-        for file in files:
-            print(f"Processing file: {file}")
-            self_generate(
-                ds_name=None,
-                parquet_file=file,
-                split=args.split,
-                args=args,
-                llm=llm,
-                system_template=SELF_GEN_SYSTEM_MSG,
-                do_truncate=args.do_truncate,
-            )
+    dataset_configs = get_dataset_configs(
+        ds_names=args.ds_names,
+        config=config,
+        split=args.split,
+    )
+
+    # Process each dataset
+    for ds_name, split in dataset_configs:
+        print(f"Processing dataset: {ds_name}, split: {split}")
+        self_generate(ds_name, split, args, llm, SELF_GEN_SYSTEM_MSG)

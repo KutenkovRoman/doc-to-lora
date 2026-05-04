@@ -25,12 +25,13 @@ def pack_data_points_by_length(
     len_arr = np.array([sum(l) for l in lens], dtype=np.long)
     ctx_len_arr = np.array([sum(l) for l in ctx_lens], dtype=np.long)
     n = len(len_arr)
-    assert len(ctx_len_arr) == n, "Length of ctx_len_arr must match length of lens"
+    assert len(ctx_len_arr) == n, "Length of ctx_len_arr must match length of len_arr"
 
     if n == 1:
         return (
-            [0]
-            if len_arr[0] <= max_packed_inp_len and ctx_len_arr[0] <= max_packed_ctx_len
+            [0] if (
+                len_arr[0] <= max_packed_inp_len and ctx_len_arr[0] <= max_packed_ctx_len
+            )
             else []
         )
 
@@ -48,6 +49,7 @@ def pack_data_points_by_length(
 
         start_sum_ctx = cumsum_ctx_len[i - 1] if i > 0 else 0
         valid_ends_ctx = (cumsum_ctx_len[i:] - start_sum_ctx) <= max_packed_ctx_len
+
         valid_ends = valid_ends_inp & valid_ends_ctx
 
         if not np.any(valid_ends):
@@ -61,7 +63,7 @@ def pack_data_points_by_length(
         # Find the last valid index
         max_valid_idx = i + np.where(valid_ends)[0][-1]
 
-        # Apply max_size constraint
+        # Apply max_size constraint (never applied)
         if max_size > 0:
             max_valid_idx = min(max_valid_idx, i + max_size - 1)
 
@@ -71,9 +73,7 @@ def pack_data_points_by_length(
     return idx_pairs
 
 
-def pack_data_points_FA(
-    batch: dict[str, any],
-) -> dict[str, np.ndarray]:
+def pack_data_points_FA(batch: dict[str, any]) -> dict[str, np.ndarray]:
     if not batch:
         raise ValueError("Batch is empty")
 
@@ -131,19 +131,17 @@ def pack_data_points_FA(
             logprobs_vals_b = concat_list(logprobs_vals_b)
             logprobs_indices_b = concat_list(logprobs_indices_b)
             logits_len = len(logprobs_vals_b)
-            logprobs_vals[logits_offset : logits_offset + logits_len] = logprobs_vals_b
-            logprobs_indices[logits_offset : logits_offset + logits_len] = (
-                logprobs_indices_b
-            )
+            logprobs_vals[logits_offset:(logits_offset + logits_len)] = logprobs_vals_b
+            logprobs_indices[logits_offset:(logits_offset + logits_len)] = logprobs_indices_b
             logits_offset += logits_len
 
     ctx_offset = 0
     for ctx_ids_b in batch["ctx_ids"]:
         local_start = ctx_offset
-        for ctx_ids_b_item in ctx_ids_b:
-            local_end = local_start + len(ctx_ids_b_item)
+        for ctx_ids_b_chunk in ctx_ids_b:  # since each context was chunked
+            local_end = local_start + len(ctx_ids_b_chunk)
             ctx_position_ids[local_start:local_end] = np.arange(
-                len(ctx_ids_b_item), dtype=np.int32
+                len(ctx_ids_b_chunk), dtype=np.int32
             )
             local_start = local_end
 
@@ -163,6 +161,7 @@ def pack_data_points_FA(
     if has_logprobs:
         out["logprobs_vals"] = logprobs_vals
         out["logprobs_indices"] = logprobs_indices
+
     return out
 
 
@@ -175,16 +174,18 @@ def pack_batch(
 ) -> dict[str, any]:
     need_flatten = check_is_iterable(batch["input_ids"][0][0])
     assert need_flatten, (
-        f"Packing requires the input_ids to be nested "
-        f"(allowing multiple QAs per sample), but got {batch['input_ids'][0]}"
+        f"Packing requires the input_ids to be nested in order to "
+        f"allow multiple QAs per sample, but got {batch['input_ids'][0]}"
     )
+
+    if "ctx_ids" not in batch:
+        raise ValueError("Batch must contain 'ctx_ids' and 'labels' keys")
 
     n_queries = [len(x) for x in batch["input_ids"]]
     n_ctx_chunks = [len(x) for x in batch["ctx_ids"]]
     inp_lens = [[len(y) for y in x] for x in batch["input_ids"]]
     inp_count = len(inp_lens)
-    if "ctx_ids" not in batch:
-        raise ValueError("Batch must contain 'ctx_ids' and 'labels' keys")
+
     # we do not pad so we can just take the length of the tokens
     ctx_lens = [[len(y) for y in x] for x in batch["ctx_ids"]]
 
@@ -217,6 +218,7 @@ def pack_batch(
 
     for idx_pair in idx_pairs:
         start_idx, end_idx = idx_pair[0], idx_pair[1]
+
         group_items = {
             "ctx_ids": batch["ctx_ids"][start_idx:end_idx],
             "input_ids": batch["input_ids"][start_idx:end_idx],
@@ -224,10 +226,10 @@ def pack_batch(
         }
         if has_logprobs:
             group_items["logprobs_vals"] = batch["logprobs_vals"][start_idx:end_idx]
-            group_items["logprobs_indices"] = batch["logprobs_indices"][
-                start_idx:end_idx
-            ]
+            group_items["logprobs_indices"] = batch["logprobs_indices"][start_idx:end_idx]
+
         packed_item = pack_data_points_FA(group_items)
+
         packed_batch["ctx_ids"].append(packed_item["ctx_ids"])
         packed_batch["ctx_position_ids"].append(packed_item["ctx_position_ids"])
         packed_batch["input_ids"].append(packed_item["input_ids"])

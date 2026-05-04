@@ -1,8 +1,8 @@
 IGNORE_INDEX = -100
 
 TRANSFORMED_DATA_DIR = "data/processed_datasets"
-RAW_DATA_DIR = "data/raw_datasets/"
-SELF_GEN_DATA_DIR = f"{RAW_DATA_DIR}/self_gen/"
+RAW_DATA_DIR = "data/raw_datasets"
+SELF_GEN_DATA_DIR = f"{RAW_DATA_DIR}/self_gen"
 
 # for chunking
 CTX_AFFIXES = {
@@ -125,6 +125,26 @@ DS_KWARGS = {
             split="train",
         )
     ),
+    "babilong_qa_1": dict(
+        train_0k=dict(path="RMT-team/babilong-1k-samples", split="qa1", name="0k"),
+        train_1k=dict(path="RMT-team/babilong-1k-samples", split="qa1", name="1k"),
+        train_2k=dict(path="RMT-team/babilong-1k-samples", split="qa1", name="2k"),
+        train_4k=dict(path="RMT-team/babilong-1k-samples", split="qa1", name="4k"),
+        train_8k=dict(path="RMT-team/babilong-1k-samples", split="qa1", name="8k"),
+        train_16k=dict(path="RMT-team/babilong-1k-samples", split="qa1", name="16k"),
+        train_32k=dict(path="RMT-team/babilong-1k-samples", split="qa1", name="32k"),
+        train_64k=dict(path="RMT-team/babilong-1k-samples", split="qa1", name="64k"),
+        train_128k=dict(path="RMT-team/babilong-1k-samples", split="qa1", name="128k"),
+        test_0k=dict(path="RMT-team/babilong", split="qa1", name="0k"),
+        test_1k=dict(path="RMT-team/babilong", split="qa1", name="1k"),
+        test_2k=dict(path="RMT-team/babilong", split="qa1", name="2k"),
+        test_4k=dict(path="RMT-team/babilong", split="qa1", name="4k"),
+        test_8k=dict(path="RMT-team/babilong", split="qa1", name="8k"),
+        test_16k=dict(path="RMT-team/babilong", split="qa1", name="16k"),
+        test_32k=dict(path="RMT-team/babilong", split="qa1", name="32k"),
+        test_64k=dict(path="RMT-team/babilong", split="qa1", name="64k"),
+        test_128k=dict(path="RMT-team/babilong", split="qa1", name="128k"),
+    )
 }
 
 # add ctx_numbers
@@ -139,19 +159,20 @@ tok_bins += [(2**15 + 2**13 * (i), 2**15 + 2**13 * (i + 1)) for i in range(12)]
 for toy_ds_name in ["ctx_numbers", "ctx_kv", "ctx_magic_number"]:
     for tok_bin in tok_bins:
         DS_KWARGS[f"{toy_ds_name}_{tok_bin[0]}_{tok_bin[1]}"] = dict(
+            # take data from parent directory
             train=dict(
                 path="json",
-                data_files=f"data/raw_datasets/{toy_ds_name}_{tok_bin[0]}_{tok_bin[1]}/train.jsonl",
+                data_files=f"./../../doc-to-lora/data/raw_datasets/{toy_ds_name}_{tok_bin[0]}_{tok_bin[1]}/train.jsonl",
                 split="train",
             ),
             validation=dict(
                 path="json",
-                data_files=f"data/raw_datasets/{toy_ds_name}_{tok_bin[0]}_{tok_bin[1]}/val.jsonl",
+                data_files=f"./../../doc-to-lora/data/raw_datasets/{toy_ds_name}_{tok_bin[0]}_{tok_bin[1]}/val.jsonl",
                 split="train",
             ),
             test=dict(
                 path="json",
-                data_files=f"data/raw_datasets/{toy_ds_name}_{tok_bin[0]}_{tok_bin[1]}/test.jsonl",
+                data_files=f"./../../doc-to-lora/data/raw_datasets/{toy_ds_name}_{tok_bin[0]}_{tok_bin[1]}/test.jsonl",
                 split="train",
             ),
         )
@@ -242,9 +263,14 @@ EVAL_INTX_TEMPLATES = {
     "squad_negative_no_passage": "Answer the following question. Output only the answer and do not output any other words.\n\nQuestion: {input}",
     "squad_assistant_ctx_no_passage": "Answer the following question. Output only the answer and do not output any other words.\n\nQuestion: {input}",
     # longbench
-    "longbench/qasper": 'Answer the question as concisely as you can, using a single phrase or sentence if possible.\nIf the question cannot be answered based on the information in the article, write "unanswerable".\nIf the question is a yes/no question, answer "yes", "no", or "unanswerable". Do not provide any explanation.\n\nQuestion: {input}',
+    "longbench/qasper": "Answer the question as concisely as you can, using a single phrase or sentence if possible.\nIf the question cannot be answered based on the information in the article, write \"unanswerable\".\nIf the question is a yes/no question, answer \"yes\", \"no\", or \"unanswerable\". Do not provide any explanation.\n\nQuestion: {input}",
     "longbench/multifieldqa_en": "Answer the following question. Only output the answer and do not output any other words.\n\nQuestion: {input}",
     "longbench/2wikimqa": "Answer the following question. Only output the answer and do not output any other words.\n\nQuestion: {input}",
+    # babilong
+    "babilong_qa_1": "Answer the following question. If a person was in different locations, use the latest location to answer the question. Output only the location and do not output any other words.\n\nQuestion: {input}",
 }
+
 for ds_name in LONGBENCH_E_TASKS:
+    # longbench e-tasks have the same name except for "_e" at the end
+    # we use the same instructions as for a task without this part
     EVAL_INTX_TEMPLATES[ds_name] = EVAL_INTX_TEMPLATES[ds_name[:-2]]
