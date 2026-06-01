@@ -373,24 +373,3 @@ def combine_lora(
             combined_loras[module_name][matrix_key] = combined
 
     return combined_loras
-
-
-def combine_coeffs(
-    generated_coeffs: Float[Tensor, "tot_chunks n_layers n_modules max_n_ctx_chunks"],
-    n_ctx_chunks: Integer[Tensor, "n_ctx"],
-) -> Float[Tensor, "n_layers n_modules tot_chunks"]:
-    tot_chunks, n_layers, n_modules, _ = generated_coeffs.shape
-
-    combined_coeffs = torch.empty(
-        (n_layers, n_modules, tot_chunks),
-        device=generated_coeffs.device,
-        dtype=generated_coeffs.dtype,
-    )
-
-    start = 0
-    for n_c in n_ctx_chunks:
-        end = start + n_c
-        combined_coeffs[:, :, start:end] = generated_coeffs[start:end, :, :, start:end].sum(0)
-        start = end
-
-    return combined_coeffs

@@ -1,14 +1,16 @@
 import logging
+import math
 
 import torch
 from torch import nn
+from torch.optim import AdamW
 from transformers import Trainer
 from transformers.trainer_pt_utils import get_parameter_names
 from transformers.trainer_utils import IntervalStrategy
 
 from ctx_to_lora.modeling.hypernet import (
     ModulatedPretrainedModel,
-    USE_RANDOM_REPR,
+    USE_ORTHOG_PROJ,
 )
 
 logger = logging.getLogger()
@@ -286,10 +288,12 @@ class CrossEntropyTrainer(ModulatedModelTrainer):
         By default, all models return the loss in the first element.
         Subclass and override for custom behavior.
         """
-
         is_train = num_items_in_batch is not None
         labels = inputs.pop("labels", None)
-        outputs, generated_weights = model(**inputs, return_generated_lora=True)
+
+        outputs, generated_weights = model(
+            **inputs, return_generated_lora=True
+        )
         # [1, tot_seq_len]
         logits = outputs.logits
 
@@ -308,56 +312,11 @@ class CrossEntropyTrainer(ModulatedModelTrainer):
         else: # eval
             loss = loss.mean()
 
-        #####
-        # if is_train:
-        #     if self.use_per_ctx_average_loss:
-        #         loss_kwargs["num_items_in_batch"] = num_items_in_batch["ctx"]
-        #     else:
-        #         loss_kwargs["num_items_in_batch"] = num_items_in_batch["labels"]
-        # inputs = {**inputs, **loss_kwargs}
-        # outputs, (gen_loras, _) = model(**inputs, return_generated_lora=True)
-
-        # # Save past state if it exists
-        # if self.args.past_index >= 0:
-        #     self._past = outputs[self.args.past_index]
-
-        # if labels is not None:
-        #     unwrapped_model = self.accelerator.unwrap_model(model)
-        #     if _is_peft_model(unwrapped_model):
-        #         model_name = unwrapped_model.base_model.model._get_name()
-        #     else:
-        #         model_name = unwrapped_model._get_name()
-        #     # User-defined compute_loss function
-        #     if self.compute_loss_func is not None:
-        #         loss = self.compute_loss_func(
-        #             outputs, labels, num_items_in_batch=num_items_in_batch["labels"]
-        #         )
-        #     elif model_name in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES.values():
-        #         loss = self.label_smoother(outputs, labels, shift_labels=True)
-        #     else:
-        #         loss = self.label_smoother(outputs, labels)
-        # else:
-        #     if isinstance(outputs, dict) and "loss" not in outputs:
-        #         raise ValueError(
-        #             "The model did not return a loss from the inputs, "
-        #             "only the following keys: "
-        #             f"{','.join(outputs.keys())}. "
-        #             "For reference, the inputs it received are "
-        #             f"{','.join(inputs.keys())}."
-        #         )
-        #     # We don't use .loss here since the model may return tuples instead of ModelOutput.
-        #     loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
-        #####
-
-        ##### unpack gen lora dict and compute regularization loss
-        if USE_RANDOM_REPR:
-            l1_norm = generated_weights.abs().sum(0).mean()
-        else:
-            l1_norm = 0
-            n_modules = len(generated_weights)
-            for _, lora in generated_weights.items():
-                l1_norm += lora["A"].abs().sum(0).mean() + lora["B"].abs().sum(0).mean()
-            l1_norm /= n_modules
+        l1_norm = 0
+        n_modules = len(generated_weights)
+        for _, lora in generated_weights.items():
+            l1_norm += lora["A"].abs().sum(0).mean() + lora["B"].abs().sum(0).mean()
+        l1_norm /= n_modules
 
         if is_train:
             # during eval `num_items_in_batch` will be None
@@ -388,72 +347,48 @@ class CrossEntropyTrainer(ModulatedModelTrainer):
         return (total_loss, outputs) if return_outputs else total_loss
 
 
-class MixedDistillationTrainer(ModulatedModelTrainer):
+class CrossEntropyTrainerCustomLogging(ModulatedModelTrainer):
     def __init__(self, *args, **kwargs):
         self.gen_lora_l1_reg_coef = kwargs.pop("gen_lora_l1_reg_coef", 0.0)
         self.use_per_ctx_average_loss = kwargs.pop("use_per_ctx_average_loss", False)
-        self.alpha = 0.7
-        self.temperature = 1.0
+        self._microbatch_count = 0  # added for logging
         super().__init__(*args, **kwargs)
 
-    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        # NOTE: the loss output from this fn will be ***added***
-        # meaning that we should always scale the loss w.r.t. `num_items_in_batch`
-        # (average over the number of items in the accumulated batch)
-
+    def compute_loss(
+        self, model, inputs, return_outputs=False, num_items_in_batch=None
+    ):
+        """
+        How the loss is computed by Trainer.
+        By default, all models return the loss in the first element.
+        Subclass and override for custom behavior.
+        """
         is_train = num_items_in_batch is not None
         labels = inputs.pop("labels", None)
-        label_pos = torch.where(labels != -100)
-        outputs, generated_loras = model(**inputs, return_generated_lora=True)
 
-        if "logprobs_vals" not in inputs:
-            return (torch.tensor(0.0), outputs) if return_outputs else torch.tensor(0.0)
-
-        target_logp = inputs.pop("logprobs_vals").squeeze(0)
-        indices = inputs.pop("logprobs_indices").squeeze(0)
-
-        assert label_pos[0].shape[0] == target_logp.shape[0], (
-            f"Label positions and target log probabilities should have the same # tokens. "
-            f"Got: {label_pos[0].shape[0] = } and {target_logp.shape[0] = }"
+        outputs, generated_weights = model(
+            **inputs, return_generated_lora=True
         )
-
-        ##### KL loss
-        shifted_logits = outputs.logits[label_pos[0], label_pos[1] - 1]  # shift back 1
-
-        logq_full_denom = torch.logsumexp(shifted_logits, dim=-1, keepdim=True)  # (N,1)
-        selected_logits = shifted_logits.gather(1, indices)  # (N,K)
-        # log softmax at selected indices
-        logq_selected = selected_logits - logq_full_denom
-        p = target_logp.exp() * (self.temperature ** 2)
-        kd_loss = -(p * logq_selected).sum(dim=-1)
-
-        ##### CE loss
+        # [1, tot_seq_len]
         logits = outputs.logits
 
-        ce_loss = causal_lm_ce_loss(logits, labels, self.model.vocab_size)
+        # [tot_seq_len]
+        loss = causal_lm_ce_loss(logits, labels, self.model.vocab_size)
 
         if self.use_per_ctx_average_loss:
-            kl_loss = per_ctx_loss_kl(inputs, labels, kl_loss)
-            ce_loss = per_ctx_loss_ce(inputs, labels, ce_loss)
+            loss = per_ctx_loss_ce(inputs, labels, loss)
 
         if is_train:
-            divisor = (
+            loss = loss.sum() / (
                 num_items_in_batch["ctx"]
                 if self.use_per_ctx_average_loss
                 else num_items_in_batch["labels"]
             )
-            kl_loss = kl_loss.sum() / divisor
-            ce_loss = ce_loss.sum() / divisor
         else: # eval
-            kl_loss = kl_loss.mean()
-            ce_loss = ce_loss.mean()
+            loss = loss.mean()
 
-        loss = self.alpha * kd_loss + (1 - self.alpha) * ce_loss
-
-        ##### unpack gen lora dict and compute regularization loss
         l1_norm = 0
-        n_modules = len(generated_loras)
-        for _, lora in generated_loras.items():
+        n_modules = len(generated_weights)
+        for _, lora in generated_weights.items():
             l1_norm += lora["A"].abs().sum(0).mean() + lora["B"].abs().sum(0).mean()
         l1_norm /= n_modules
 
@@ -464,7 +399,7 @@ class MixedDistillationTrainer(ModulatedModelTrainer):
         total_loss = loss + self.gen_lora_l1_reg_coef * l1_norm
         #####
 
-        scaler = self.args.gradient_accumulation_steps if is_train else 1
+        scaler = self.args.gradient_accumulation_steps if is_train else 1.0
         if self.args.average_tokens_across_devices and is_train:
             total_loss *= self.accelerator.num_processes
             scaler *= self.accelerator.num_processes
@@ -479,12 +414,52 @@ class MixedDistillationTrainer(ModulatedModelTrainer):
         ):
             # compensate `num_items_in_batch` division
             self.log({
-                "kl_loss": kd_loss.item() * scaler,
-                "ce_loss": ce_loss.item() * scaler,
+                "ce_loss": loss.item() * scaler,
                 "gen_lora_l1_norm": l1_norm.item() * scaler,
             })
 
         return (total_loss, outputs) if return_outputs else total_loss
+
+    def training_step(self, model, inputs, num_items_in_batch=None):
+        loss = super().training_step(model, inputs, num_items_in_batch)
+        self._microbatch_count += 1
+
+        # Optimizer is about to step; this gradient corresponds to step (global_step + 1)
+        next_optimizer_step = self.state.global_step + 1
+
+        if not (
+            self._microbatch_count % self.args.gradient_accumulation_steps == 0 and
+            next_optimizer_step % self.args.logging_steps == 0
+        ):
+            return loss
+
+        # Reset microbatch count for whatever reason
+        self._microbatch_count = 0
+
+        with torch.no_grad():
+            E = model.hypernet.aggregator.perceiver.slot_table.weight
+            head = model.hypernet.head.weight
+            gamma = model.hypernet.layers.film.gamma_proj.weight
+            beta = model.hypernet.layers.film.beta_proj.weight
+            if E.grad is not None:
+                per_slot = E.grad.norm(dim=-1)  # [max_num_slots,]
+                stats = {
+                    "slot_grad_mean": per_slot[:-1].mean().item(),
+                    "slot_grad_max": per_slot[:-1].max().item(),
+                    "slot_grad_min": per_slot.min().item(),
+                    "slot_grad_std": per_slot[:-1].std().item(),
+                    "slot_grad_last": per_slot[-1].item(),
+                    "slot_grad_below_eps": (per_slot < 1e-5).float().mean().item(),
+                }
+                if head.grad is not None:
+                    stats["head_norm"] = head.grad.norm().item()
+                if gamma.grad is not None:
+                    stats["gamma_norm"] = gamma.grad.norm().item()
+                if beta.grad is not None:
+                    stats["beta_norm"] = beta.grad.norm().item()
+                self.log(stats)
+
+        return loss
 
 
 def get_decay_parameter_names(model) -> list[str]:
@@ -532,6 +507,9 @@ def train_model(
     if is_modulated_model:
         logger.info("Training with modulated model.")
         trainer_cls = CrossEntropyTrainer
+        if USE_ORTHOG_PROJ:
+            trainer_cls = CrossEntropyTrainerCustomLogging
+
         trainer_kwargs["gen_lora_l1_reg_coef"] = training_args.gen_lora_l1_reg_coef
         trainer_kwargs["use_per_ctx_average_loss"] = (
             training_args.use_per_ctx_average_loss
@@ -542,7 +520,6 @@ def train_model(
         if training_args.use_kl_loss:
             logger.info("Training with distillation loss. Using DistillationTrainer.")
             trainer_cls = DistillationTrainer
-            # trainer_cls = MixedDistillationTrainer
             del training_args.use_kl_loss
 
     if training_args.auto_find_batch_size:

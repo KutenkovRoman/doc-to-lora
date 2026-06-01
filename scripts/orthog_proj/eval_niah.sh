@@ -1,0 +1,16 @@
+#!/bin/bash
+set -euo pipefail
+
+export CUDA_VISIBLE_DEVICES=1
+export WANDB_MODE=disabled
+
+# --max_test_samples_per_ds=20
+# --datasets ctx_magic_number_32_1024 ctx_magic_number_1024_2048 ctx_magic_number_3072_4096 ctx_magic_number_7168_8192 ctx_magic_number_15360_16384 ctx_magic_number_28672_32768 ctx_magic_number_57344_65536 ctx_magic_number_122880_131072
+
+conda run --live-stream -n D2L python run_eval.py \
+    --checkpoint_path "./train_outputs/runs/[film without curriculum]/checkpoint-4200/pytorch_model.bin" \
+    --max_ctx_chunk_len=512 \
+    --split test \
+    --eval_batch_size_gen=4 \
+    --datasets ctx_magic_number_1024_2048
+    # ctx_magic_number_32_1024 ctx_magic_number_1024_2048 ctx_magic_number_2048_3072 ctx_magic_number_3072_4096 ctx_magic_number_4096_5120 ctx_magic_number_5120_6144 ctx_magic_number_6144_7168 ctx_magic_number_7168_8192 ctx_magic_number_8192_9216 ctx_magic_number_9216_10240 ctx_magic_number_10240_11264 ctx_magic_number_11264_12288 ctx_magic_number_12288_13312 ctx_magic_number_13312_14336 ctx_magic_number_14336_15360 ctx_magic_number_15360_16384 ctx_magic_number_16384_20480 ctx_magic_number_20480_24576 ctx_magic_number_24576_28672 ctx_magic_number_28672_32768 ctx_magic_number_32768_40960 ctx_magic_number_40960_49152 ctx_magic_number_49152_57344 ctx_magic_number_57344_65536 ctx_magic_number_65536_73728 ctx_magic_number_73728_81920 ctx_magic_number_81920_90112 ctx_magic_number_90112_98304 ctx_magic_number_98304_106496 ctx_magic_number_106496_114688 ctx_magic_number_114688_122880 ctx_magic_number_122880_131072

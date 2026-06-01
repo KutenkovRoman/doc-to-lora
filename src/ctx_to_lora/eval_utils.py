@@ -53,7 +53,7 @@ from ctx_to_lora.model_loading import (
 )
 from ctx_to_lora.modeling.context_distillation import CtxDistillModel
 from ctx_to_lora.modeling.generative_adapter import GenerativeAdapter
-from ctx_to_lora.modeling.hypernet import ModulatedPretrainedModel
+from ctx_to_lora.modeling.hypernet import ModulatedPretrainedModel, USE_ORTHOG_PROJ
 from ctx_to_lora.modeling.llm_lingua import LLMLinguaModel
 from ctx_to_lora.modeling.text_to_lora import TextToLoRA
 from ctx_to_lora.tracker.tracker import (
@@ -547,9 +547,7 @@ def eval_generation(
 
         clear_gpu()
         eval_result = eval_trainer.predict(
-            ds,
-            metric_key_prefix=split_name,
-            **gen_kwargs,
+            ds, metric_key_prefix=split_name, **gen_kwargs
         )
         decoded_txts = decode_test_result(ds, eval_result, tokenizer, ctx_tokenizer)
 
@@ -714,7 +712,7 @@ def evaluate(
     #assert split in ["validation", "test"]
 
     ctx_name = None
-    model_kwargs = dict(attn_implementation="flash_attention_2")
+    model_kwargs = {"attn_implementation": "flash_attention_2"}
 
     tokenizer = get_tokenizer(args.model_name_or_path, train=False)
     if tokenizer.pad_token_id is None:

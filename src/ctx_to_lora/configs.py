@@ -231,6 +231,10 @@ class TrainingArguments(TrainingArguments):
         default=None,
         metadata={"help": "Learning rate scheduler kwargs."},
     )
+    warmup_steps: int = field(
+        default=100,
+        metadata={"help": "Number of warmup steps."},
+    )
     eval_on_start: bool = field(
         default=False,
         metadata={"help": "Whether to evaluate on the start of training."},
@@ -457,6 +461,10 @@ class DataArguments:
     custom_train_splits: list[str] | None = field(
         default=None,
         metadata={"help": "Custom splits for a specific training dataset."},
+    )
+    run_custom_name: str = field(
+        default=None,
+        metadata={"help": "Name that will be used to identify run."},
     )
 
 

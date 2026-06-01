@@ -88,7 +88,7 @@ class Perceiver(nn.Module):
         # num_latent_factor,  # unused
         layer_to_layer_ctx_encoder,
         n_latent_queries,
-        use_random_repr,
+        use_orthog_proj,
         *args, **kwargs,
     ):
         super().__init__()
@@ -125,7 +125,10 @@ class Perceiver(nn.Module):
             hidden_size=output_size,
             attn_implementation="flash_attention_2",
         )
-        self.perceiver = Idefics2Perceiver(self.config, self.decoder_config, use_random_repr)
+        self.perceiver = Idefics2Perceiver(
+            self.config, self.decoder_config,
+            use_orthog_proj=use_orthog_proj,
+        )
         self.iterative_mode = False
 
     def enable_iterative_mode(self, flag: bool):
@@ -162,7 +165,7 @@ class Perceiver(nn.Module):
                     "1 n_layers seq_len feature_dim -> 1 (n_layers seq_len) feature_dim",
                 )
 
-        outputs = self.perceiver(
+        outputs, slot_emb = self.perceiver(
             features,
             attn_mask,
             position_ids,
@@ -189,8 +192,12 @@ class Perceiver(nn.Module):
                 n_layers=self.num_layers,
                 per_layer_size=per_layer_size,
             )
+            slot_emb = rearrange(  # not tested!
+                slot_emb,
+                "(n_layers bs) d -> bs n_layers d",
+                n_layers=self.num_layers,
+            )
 
-        # before: lora, extra = unpack(...)
         lora, _ = unpack(
             outputs,
             [
@@ -209,16 +216,7 @@ class Perceiver(nn.Module):
         if not self.per_rank_gen:
             lora = lora.squeeze(3)
 
-        # before: extra was ignored anyway
-        # extra = rearrange(
-        #     extra,
-        #     "bs (n_layers n_extra_modules) d -> bs n_layers n_extra_modules d",
-        #     n_extra_modules=self.num_extra_modules,
-        #     n_layers=self.num_layers,
-        # )
-
-        # before: return lora, extra
-        return lora
+        return lora, slot_emb
 
 
 AGGREGATOR_CLS = {

@@ -122,7 +122,9 @@ def main():
         if not checkpoint_dir
         else checkpoint_dir.strip("/").split("/")[-2]
     )
-    # run_name = "debug"  # to avoid creating lots of run directories when debugging
+
+    if data_args.run_custom_name:  # use custom name if provided
+        run_name = data_args.run_custom_name
 
     output_dir = f"train_outputs/runs/{run_name}"
     setup_logging(output_dir, debug=os.getenv("DEBUG", False))
@@ -362,7 +364,6 @@ def main():
 
         logger.info(f"val_ds: {val_ds}")
 
-    # if ctx_args.use_sequence_packing:
     with training_args.main_process_first():
         train_ds = pack(
             train_ds,
@@ -374,33 +375,6 @@ def main():
         )
         logger.info("Setting per_device_train_batch_size to 1")
         training_args.per_device_train_batch_size = 1
-    # else:  # does not really work
-    #     train_ds_lens = [len(ds) for ds in train_ds.values()]
-    #     total_samples = sum(train_ds_lens)
-    #     train_ds = interleave_datasets(
-    #         list(train_ds.values()),
-    #         probabilities=get_ds_prob(train_ds_lens, total_samples),
-    #         seed=training_args.seed,
-    #         stopping_strategy="all_exhausted",
-    #     )
-    #     logger.info(f"Interleaved train dataset: {train_ds}")
-
-    # max_prod = 0
-    # seq_len_max = bs_max = 0
-    # for sample in train_ds:
-    #     ctx_position_ids = sample["ctx_position_ids"]
-    #     seq_len = len(ctx_position_ids)
-    #     bs = (np.array(ctx_position_ids) == 0).sum().item()
-    #     prod = seq_len * bs
-    #     if prod > max_prod:
-    #         max_prod = prod
-    #         seq_len_max = seq_len
-    #         bs_max = bs
-    # seq_len_max *= 26
-    # bs_max *= 26
-    # max_prod = seq_len_max * bs_max
-    # print(f"We have {max_prod = } with seq_len = {seq_len_max} * bs = {bs_max}")
-    # print(f"Dataset stats: {max_seq_len = } and {max_bs = }")
 
     collator = flatten_if_not_packed
 

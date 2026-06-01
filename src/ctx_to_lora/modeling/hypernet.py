@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from functools import partial
 from math import sqrt
 from typing import Any
-import re
+import os
 
 import torch
 from einops import unpack
@@ -47,8 +47,9 @@ from ctx_to_lora.modeling.lora_layer import (
     apply_lora_to_layers,
     lora_forward,
     lora_forward_packed,
-    random_repr_forward,
-    apply_random_repr,
+    orthog_proj_forward,
+    orthog_proj_forward_packed,
+    apply_orthog_proj,
 )
 from ctx_to_lora.modeling.lora_merger import (
     ChunkwiseAttentionPoolMerger,
@@ -64,7 +65,10 @@ from ctx_to_lora.utils import (
     get_peft_modules,
 )
 
-USE_RANDOM_REPR = True  # flag for development
+from safetensors.torch import save_file, load_file
+
+# Flag for development
+USE_ORTHOG_PROJ = False
 
 logger = logging.getLogger()
 
@@ -202,8 +206,7 @@ class ResMLPBlockPerLayer(nn.Module):
 
         up_proj_pattern = "bs n_layers n_modules r d_in -> bs n_layers n_modules r d_hid"
         down_proj_pattern = "bs n_layers n_modules r d_hid -> bs n_layers n_modules r d_out"
-        if not per_rank_gen:
-            # get rid of rank dimension
+        if not per_rank_gen:  # get rid of rank dimension
             up_proj_pattern = up_proj_pattern.replace(" r ", " ")
             down_proj_pattern = down_proj_pattern.replace(" r ", " ")
 
@@ -234,6 +237,123 @@ class ResMLPBlockPerLayer(nn.Module):
         return x + self.layers(x)
 
 
+class PerLayerFiLM(nn.Module):
+    def __init__(
+        self,
+        n_layers: int,
+        n_modules: int,
+        embed_size: int,
+        hidden_size: int,
+        per_rank_gen: bool,
+    ):
+        super().__init__()
+
+        self.per_rank_gen = per_rank_gen
+        
+        self.gamma_proj = Mix(
+            "bs d_emb -> bs n_layers n_modules d_hid",
+            weight_shape="n_layers n_modules d_emb d_hid",
+            bias_shape="n_layers n_modules d_hid",
+            n_layers=n_layers,
+            n_modules=n_modules,
+            d_emb=embed_size,
+            d_hid=hidden_size,
+        )
+        self.beta_proj = Mix(
+            "bs d_emb -> bs n_layers n_modules d_hid",
+            weight_shape="n_layers n_modules d_emb d_hid",
+            bias_shape="n_layers n_modules d_hid",
+            n_layers=n_layers,
+            n_modules=n_modules,
+            d_emb=embed_size,
+            d_hid=hidden_size,
+        )
+
+        with torch.no_grad():
+            self.gamma_proj.weight.zero_()
+            self.gamma_proj.bias.fill_(1.0)
+            self.beta_proj.weight.zero_()
+            self.beta_proj.bias.zero_()
+
+    def forward(self, h, slot_emb):
+        """
+        h:        [bs, n_layers, n_modules, r, d_hid]
+        slot_emb: [bs, d_emb]
+        returns:  [bs, n_layers, n_modules, r, d_hid]
+        """
+        # [bs, n_layers, n_modules, d_hid]
+        gamma = self.gamma_proj(slot_emb)
+        beta = self.beta_proj(slot_emb)
+
+        if self.per_rank_gen:
+            return gamma[:, :, :, None, :] * h + beta[:, :, :, None, :]
+
+        return gamma * h + beta
+
+
+class FiLMResMLPBlockPerLayer(nn.Module):
+    def __init__(
+        self,
+        n_layers: int,
+        n_modules: int,
+        input_size: int,
+        hidden_size: int,
+        output_size: int,
+        per_rank_gen: bool,
+        embed_size: int,
+    ):
+        super().__init__()
+
+        up_proj_pattern = "bs n_layers n_modules r d_in -> bs n_layers n_modules r d_hid"
+        down_proj_pattern = "bs n_layers n_modules r d_hid -> bs n_layers n_modules r d_out"
+        if not per_rank_gen:  # get rid of rank dimension
+            up_proj_pattern = up_proj_pattern.replace(" r ", " ")
+            down_proj_pattern = down_proj_pattern.replace(" r ", " ")
+
+        before_film = [
+            nn.LayerNorm(input_size),
+            Mix(
+                up_proj_pattern,
+                weight_shape="n_layers d_in d_hid",
+                bias_shape="n_layers d_hid",
+                n_layers=n_layers,
+                d_in=input_size,
+                d_hid=hidden_size,
+            ),
+            nn.SiLU(),
+        ]
+        after_film = [
+            Mix(
+                down_proj_pattern,
+                weight_shape="n_layers d_hid d_out",
+                bias_shape="n_layers d_out",
+                n_layers=n_layers,
+                d_hid=hidden_size,
+                d_out=output_size,
+            ),
+            nn.LayerNorm(output_size),
+        ]
+
+        self.before_film = nn.Sequential(*before_film)
+        self.film = PerLayerFiLM(
+            n_layers,
+            n_modules,
+            embed_size,
+            hidden_size,
+            per_rank_gen,
+        )
+        self.after_film = nn.Sequential(*after_film)
+
+    def forward(self, x, slot_emb):
+        h = self.before_film(x)
+
+        if slot_emb is not None:
+            h = self.film(h, slot_emb)
+
+        h = self.after_film(h)
+        return x + h
+
+
 class HyperLoRA(nn.Module):
     def __init__(self, config: HypernetConfig):
         super().__init__()
@@ -249,23 +369,14 @@ class HyperLoRA(nn.Module):
     def _init_model(self):
         self.agg_config = self.config.aggregator_config
         self.aggregator = AGGREGATOR_CLS[self.agg_config.aggregator_type](
-            **vars(self.agg_config),
-            use_random_repr=USE_RANDOM_REPR,
+            **vars(self.agg_config), use_orthog_proj=USE_ORTHOG_PROJ
         )
 
-        # if USE_RANDOM_REPR:
-        #     self.lora_config = None
-        #     self.r = 0
-        #     self.target_modules = ("down_proj",)
-        # else:
-        #     self.lora_config = self.config.lora_config  # should not be None
-        #     self.r = self.lora_config.r
-        #     self.target_modules = tuple(sorted(self.lora_config.target_modules))
         self.lora_config = self.config.lora_config
         self.r = self.lora_config.r
         self.target_modules = tuple(sorted(self.lora_config.target_modules))
 
-        self.num_modules = len(self.target_modules) if self.target_modules else 0
+        self.n_modules = len(self.target_modules) if self.target_modules else 0
         self.extra_modules = (
             self.config.extra_modules
             if self.config.extra_modules
@@ -279,102 +390,89 @@ class HyperLoRA(nn.Module):
         self.d_latent = self.config.latent_size
 
         if self.target_modules:
-            if self.config.per_layer_processing:
-                layers = [
-                    ResMLPBlockPerLayer(
-                        self.n_layers,
-                        self.d_latent,
-                        self.d_latent * 4,
-                        self.d_latent,
-                        self.aggregator.per_rank_gen,
-                    )
-                    for _ in range(self.config.num_pre_head_layers)
-                ]
-            else:
-                layers = [
-                    ResMLPBlock(
-                        input_size=self.config.latent_size,
-                        hidden_size=self.config.latent_size * 4,
-                        output_size=self.config.latent_size,
-                        dropout_rate=getattr(self.config, "dropout_rate", 0),
-                    )
-                    for _ in range(self.config.num_pre_head_layers)
-                ]
+            if USE_ORTHOG_PROJ:
+                assert self.config.per_layer_processing and self.config.num_pre_head_layers == 1
 
-            self.layers = nn.Sequential(*layers)
-
-            if USE_RANDOM_REPR:
-                # for compatibility
-                self.d_lora = 0
-                self.bias_A = None
-                self.bias_B = None
-                self.scaler_A = None
-                self.scaler_B = None
-                self.chunk_merge_modules = None
-            else:
-                self.d_lora = max(self.d_in[m] + self.d_out[m] for m in self.target_modules)
-
-                self.bias_A = nn.ParameterDict({
-                    m: nn.Parameter(
-                        torch.normal(
-                            0.0, 0.2 / (self.d_in[m] * self.r) ** 0.5,
-                            (self.n_layers, self.r, self.d_in[m]),
-                        )
-                    )
-                    for m in self.target_modules
-                })
-                self.bias_B = nn.ParameterDict({
-                    m: nn.Parameter(torch.zeros((self.n_layers, self.r, self.d_out[m])))
-                    for m in self.target_modules
-                })
-
-                self.scaler_A = nn.ParameterDict({
-                    m: nn.Parameter(torch.ones((1, self.n_layers, self.r, 1)))
-                    for m in self.target_modules
-                })
-                self.scaler_B = nn.ParameterDict({
-                    m: nn.Parameter(torch.zeros((1, self.n_layers, self.r, 1)))
-                    for m in self.target_modules
-                })
-
-                self.chunk_merge_modules = None
-                merge_module_factory = {
-                    "mlp": (lambda: ChunkwiseMLPMerger(self.r)),
-                    "deepsets": ChunkwiseDeepSetsMerger,
-                    "attnpool": ChunkwiseAttentionPoolMerger,
-                }
-                if self.config.chunk_lora_merge_mode in merge_module_factory:
-                    merger_ctor = merge_module_factory[self.config.chunk_lora_merge_mode]
-                    self.chunk_merge_modules = nn.ModuleDict({
-                        m: nn.ModuleDict({
-                            "A": merger_ctor(),
-                            "B": merger_ctor(),
-                        })
-                        for m in self.target_modules
-                    })
-
-            n_modules = len(self.target_modules)
-            if USE_RANDOM_REPR:
-                assert not self.aggregator.per_rank_gen
-                assert n_modules == 1  # test case only for down_proj module
-
-                #max_num_chunks = 128
-                self.head = Mix(
-                    #"bs n_layers n_modules d_latent -> bs n_layers n_modules max_n_chunks",
-                    "bs n_layers n_modules d_latent -> bs n_layers n_modules reprs_per_chunk",
-                    # should include n_modules, but since it is 1 we omit it...,
-                    weight_shape="n_layers d_latent reprs_per_chunk", #"n_layers d_latent max_n_chunks"
-                    bias_shape=None,  # no bias
-                    n_layers=len(self.layer_indices),
-                    d_latent=self.config.latent_size,
-                    reprs_per_chunk=3, #max_n_chunks=max_num_chunks
+                self.layers = FiLMResMLPBlockPerLayer(
+                    n_layers=self.n_layers,
+                    n_modules=self.n_modules,
+                    input_size=self.d_latent,
+                    hidden_size=self.d_latent * 4,
+                    output_size=self.d_latent,
+                    per_rank_gen=self.aggregator.per_rank_gen,
+                    embed_size=self.aggregator.config.hidden_size,
                 )
+            else:
+                if self.config.per_layer_processing:
+                    layers = [
+                        ResMLPBlockPerLayer(
+                            n_layers=self.n_layers,
+                            input_size=self.d_latent,
+                            hidden_size=self.d_latent * 4,
+                            output_size=self.d_latent,
+                            per_rank_gen=self.aggregator.per_rank_gen,
+                        )
+                        for _ in range(self.config.num_pre_head_layers)
+                    ]
+                else:
+                    layers = [
+                        ResMLPBlock(
+                            input_size=self.config.latent_size,
+                            hidden_size=self.config.latent_size * 4,
+                            output_size=self.config.latent_size,
+                            dropout_rate=getattr(self.config, "dropout_rate", 0),
+                        )
+                        for _ in range(self.config.num_pre_head_layers)
+                    ]
+
+                self.layers = nn.Sequential(*layers)
+
+            self.d_lora = max(self.d_in[m] + self.d_out[m] for m in self.target_modules)
+
+            self.bias_A = nn.ParameterDict({
+                m: nn.Parameter(
+                    torch.normal(
+                        0.0, 0.2 / (self.d_in[m] * self.r) ** 0.5,
+                        (self.n_layers, self.r, self.d_in[m]),
+                    )
+                )
+                for m in self.target_modules
+            })
+            self.bias_B = nn.ParameterDict({
+                m: nn.Parameter(torch.zeros((self.n_layers, self.r, self.d_out[m])))
+                for m in self.target_modules
+            })
+
+            self.scaler_A = nn.ParameterDict({
+                m: nn.Parameter(torch.ones((1, self.n_layers, self.r, 1)))
+                for m in self.target_modules
+            })
+            self.scaler_B = nn.ParameterDict({
+                m: nn.Parameter(torch.zeros((1, self.n_layers, self.r, 1)))
+                for m in self.target_modules
+            })
+
+            self.chunk_merge_modules = None
+            merge_module_factory = {
+                "mlp": (lambda: ChunkwiseMLPMerger(self.r)),
+                "deepsets": ChunkwiseDeepSetsMerger,
+                "attnpool": ChunkwiseAttentionPoolMerger,
+            }
+            if self.config.chunk_lora_merge_mode in merge_module_factory:
+                merger_ctor = merge_module_factory[self.config.chunk_lora_merge_mode]
+                self.chunk_merge_modules = nn.ModuleDict({
+                    m: nn.ModuleDict({
+                        "A": merger_ctor(),
+                        "B": merger_ctor(),
+                    })
+                    for m in self.target_modules
+                })
 
             # have to do this otherwise doesnt work with adamw_torch_fused
             # has something to do with the bias shape (n_modules r d_lora)
             # when n_modules == 1, adamw_torch_fused complains about device/layout
             # but when n_modules > 1, it works fine
-            elif n_modules == 1:
+            elif self.n_modules == 1:
                 self.head = Mix(
                     "bs n_layers n_modules r d_latent -> bs n_layers n_modules r d_lora",
                     weight_shape="n_layers d_latent d_lora",
@@ -390,7 +488,7 @@ class HyperLoRA(nn.Module):
                     weight_shape="n_layers n_modules d_latent d_lora",
                     bias_shape=None,  # no bias
                     n_layers=len(self.layer_indices),
-                    n_modules=n_modules,
+                    n_modules=self.n_modules,
                     d_latent=self.config.latent_size,
                     r=self.config.lora_config.r,
                     d_lora=self.d_lora,
@@ -469,7 +567,7 @@ class HyperLoRA(nn.Module):
                 # features: [bs, n_layers, seq_len, feature_dim]
                 bs, n_layers = features.shape[0:2]
                 lora_emb = torch.empty(
-                    (bs, n_layers, self.num_modules, self.r, self.config.latent_size),
+                    (bs, n_layers, self.n_modules, self.r, self.config.latent_size),
                     device=features.device,
                 )
                 for i in range(n_layers):
@@ -478,23 +576,21 @@ class HyperLoRA(nn.Module):
                     )
             else:
                 # batched inference
-                lora_emb = self.aggregator(
+                lora_emb, slot_emb = self.aggregator(
                     features, attn_mask, position_ids,
                     n_ctx_chunks, repr_seeds, generator,
                 )
 
-        # rename flat_loras -> flat_weights or something?
         flat_loras = None
         if self.target_modules:
-            lora_emb = self.layers(lora_emb)
+            if USE_ORTHOG_PROJ:
+                lora_emb = self.layers(lora_emb, slot_emb)
+            else:
+                lora_emb = self.layers(lora_emb)
             norm = torch.norm(lora_emb, dim=-1, keepdim=True)
             norm_lora_emb = lora_emb / norm
-            # [bs, n_layers, n_modules, r, d_lora]
-            flat_loras = self.head(norm_lora_emb)
+            flat_loras = self.head(norm_lora_emb)  # [bs, n_layers, n_modules, r, d_lora]
 
-        # before: flat_layernorms = None
-
-        # before: return flat_loras, flat_layernorms
         return flat_loras
 
     def generate_weights(
@@ -506,13 +602,11 @@ class HyperLoRA(nn.Module):
         repr_seeds: Integer[Tensor, "n_ctx"] | None = None,
         generator: torch.Generator | None = None,
     ):
-        # before: flat_loras, flat_layernorms = self.forward(features, attn_mask, position_ids)
         flat_loras = self.forward(
             features, attn_mask, position_ids,
             n_ctx_chunks, repr_seeds, generator,
         )
-        # before: return self._to_lora_dict(flat_loras), self._to_layernorm_dict(flat_layernorms)
-        return flat_loras if USE_RANDOM_REPR else self._to_lora_dict(flat_loras)
+        return self._to_lora_dict(flat_loras)
 
 
 class ModulatedPretrainedModel(nn.Module):
@@ -544,11 +638,12 @@ class ModulatedPretrainedModel(nn.Module):
 
         self.register_module("base_model", base_model)
         self._init_model()
-        if not USE_RANDOM_REPR:  # otherwise use default initialization
-            self._bias_hyper_init()
+        self._bias_hyper_init()
 
         self.repr_seeds = None
         self.generator = None
+        if USE_ORTHOG_PROJ:
+            self._load_or_compute_svd()
 
     @classmethod
     def from_state_dict(
@@ -582,13 +677,18 @@ class ModulatedPretrainedModel(nn.Module):
         ctx_encoder_args = state_dict["ctx_encoder_args"]
         model = cls(base_model, hypernet_config, ctx_encoder_args, **kwargs)
         model.load_state_dict(state_dict)
+        if USE_ORTHOG_PROJ:
+            model._load_or_compute_svd()
         return model
 
     def patch_lora_forward(self):
         layers = get_layers(self.base_model)
 
-        if USE_RANDOM_REPR:
-            forward_fn = random_repr_forward
+        if USE_ORTHOG_PROJ:
+            forward_fn = (
+                orthog_proj_forward_packed if self.use_sequence_packing else
+                orthog_proj_forward
+            )
         else:
             forward_fn = (
                 lora_forward_packed if self.use_sequence_packing else
@@ -616,13 +716,6 @@ class ModulatedPretrainedModel(nn.Module):
             HyperLoRA(self.hypernet_config).to(self.device).to(torch.float32)
         )
 
-        # if USE_RANDOM_REPR:
-        #     # assumes base_model is AutoModelForCausalLM
-        #     self.wrap_orthog_repr()
-        # else:
-        #     # assumes base_model is PeftModel
-        #     self.base_model.disable_adapter_layers()
-        #     self.patch_lora_forward()
         self.base_model.disable_adapter_layers()
         self.patch_lora_forward()
 
@@ -645,6 +738,53 @@ class ModulatedPretrainedModel(nn.Module):
         self.ctx_encoder = CTX_ENCODER_CLS[self.ctx_encoder_args.ctx_encoder_type](
             encoder_model, self.ctx_encoder_args
         )
+    
+    def _load_or_compute_svd(self):
+        # FIX: hardcoded values for gemma-2-2b-it down_proj module
+        cache_path = "/home/jovyan/veprikov/Doc-To-Lora/doc-to-lora/svd_cache/gemma-2-2b-it/down_proj_svd.safetensors"
+
+        loaded_cache = False
+        if os.path.exists(cache_path):
+            try:
+                self.svd = load_file(cache_path, device="cpu")
+            except Exception as e:
+                print(f"Cache load failed: {e}")
+
+            loaded_cache = True
+            logger.info("Successfully loaded SVD cache")
+
+        if not loaded_cache:
+            logger.info("Computing SVD for down_proj...")
+
+            self.svd = {}
+
+            layers = get_layers(self.base_model)
+            for layer_idx in self.hypernet.layer_indices:
+                for module_info in get_peft_modules(layers[layer_idx], self.peft_config):
+                    name = module_info["name"]
+                    module = module_info["module"]
+                    if "down_proj" in name:
+                        full_name = f"{layer_idx.item()}.{name}"
+                        logger.info(f"Computing svd for layer {full_name}")
+
+                        W0 = module.base_layer.weight.data.to(torch.float32)
+                        U, S, Vh = torch.linalg.svd(W0, full_matrices=False)
+                        V = Vh.T
+
+                        self.svd[f"{full_name}.V"] = V.to(
+                            dtype=module.base_layer.weight.dtype
+                        ).cpu().contiguous()
+                        self.svd[f"{full_name}.U"] = U.to(
+                            dtype=module.base_layer.weight.dtype
+                        ).cpu().contiguous()
+
+                        del W0, S, Vh
+                        torch.cuda.empty_cache()
+
+            os.makedirs(os.path.dirname(cache_path) or '.', exist_ok=True)
+            save_file(self.svd, cache_path)
+
+        self.svd = {name: vecs.to(self.base_model.device) for name, vecs in self.svd.items()}
 
     @property
     def config(self):
@@ -728,32 +868,42 @@ class ModulatedPretrainedModel(nn.Module):
         **kwargs: Any,
     ):
         with torch.no_grad():
-            if USE_RANDOM_REPR:
-                # print(f"{ctx_position_ids.size() = }")
-                position_ids = ctx_position_ids.squeeze(0)
-                ctx_lens = position_ids[torch.where(position_ids == 0)[0][1:] - 1]
-                ctx_lens = torch.cat(  # [tot_chunks]
-                    (ctx_lens, torch.tensor([position_ids[-1]], device=ctx_lens.device))
-                )
-                ctx_lens += 1
-                tot_len = ctx_lens.sum().item()
-                tot_chunks = n_ctx_chunks.sum().item()
+            if USE_ORTHOG_PROJ:
+                if ctx_position_ids is not None:
+                    # print(f"{ctx_position_ids.size() = }")
+                    position_ids = ctx_position_ids.squeeze(0)
+                    ctx_lens = position_ids[torch.where(position_ids == 0)[0][1:] - 1]
+                    ctx_lens = torch.cat(  # [tot_chunks]
+                        (ctx_lens, torch.tensor([position_ids[-1]], device=ctx_lens.device))
+                    )
+                    ctx_lens += 1
+                    tot_len = ctx_lens.sum().item()
+                    tot_chunks = n_ctx_chunks.sum().item()
 
-                n_ctx = len(n_ctx_chunks)
+                    n_ctx = len(n_ctx_chunks)
 
-                index = torch.repeat_interleave(
-                    torch.arange(n_ctx, device=ctx_ids.device),
-                    n_ctx_chunks, dim=0, output_size=tot_chunks
-                )
-                index = torch.repeat_interleave(
-                    index, ctx_lens, dim=0, output_size=tot_len
-                )
-                self.repr_seeds = torch.zeros(n_ctx, dtype=ctx_ids.dtype, device=ctx_ids.device)
+                    index = torch.repeat_interleave(
+                        torch.arange(n_ctx, device=ctx_ids.device),
+                        n_ctx_chunks, dim=0, output_size=tot_chunks
+                    )
+                    index = torch.repeat_interleave(
+                        index, ctx_lens, dim=0, output_size=tot_len
+                    )
 
-                # print(f"{index = }")
-                # print(f"{ctx_ids.size() = }")
+                    self.repr_seeds = torch.zeros(n_ctx, dtype=ctx_ids.dtype, device=ctx_ids.device)
+                    self.repr_seeds.scatter_add_(0, index, ctx_ids.squeeze(0))
+                else:
+                    tot_chunks = n_ctx_chunks.sum().item()
+                    n_ctx = len(n_ctx_chunks)
 
-                self.repr_seeds.scatter_add_(0, index, ctx_ids.squeeze(0))
+                    index = torch.repeat_interleave(
+                        torch.arange(n_ctx, device=ctx_ids.device),
+                        n_ctx_chunks, dim=0, output_size=tot_chunks
+                    )
+
+                    self.repr_seeds = torch.zeros(n_ctx, dtype=ctx_ids.dtype, device=ctx_ids.device)
+                    self.repr_seeds.scatter_add_(0, index, (ctx_ids * ctx_attn_mask).sum(-1))
+
                 self.generator = torch.Generator(device=ctx_ids.device)
 
             ctx_encoder_kwargs = dict(
@@ -791,14 +941,6 @@ class ModulatedPretrainedModel(nn.Module):
         if isinstance(self.ctx_encoder.base_model, ModernBertModel):
             ctx_features = ctx_features.unsqueeze(0)
 
-        # before: had a separate exit point
-        # if self.user_defined_scaling == 1:
-        #     return self.hypernet.generate_weights(
-        #         ctx_features, ctx_attn_mask, ctx_position_ids
-        #     )
-        # lora_dict = self.hypernet.generate_weights(...)
-
-        # lora_dict -> outputs
         outputs = self.hypernet.generate_weights(
             ctx_features,
             ctx_attn_mask,
@@ -808,14 +950,13 @@ class ModulatedPretrainedModel(nn.Module):
             self.generator,
         )
 
-        if self.user_defined_scaling == 1.0:  # should be an exit point for random repr
+        if self.user_defined_scaling == 1.0:
             return outputs
 
         for module in outputs:
             outputs[module]["A"] = outputs[module]["A"] * self.user_defined_scaling
             outputs[module]["B"] = outputs[module]["B"] * self.user_defined_scaling
 
-        # before: return lora_dict, None
         return outputs
 
     def enable_iterative_mode(self, flag: bool):
@@ -833,9 +974,7 @@ class ModulatedPretrainedModel(nn.Module):
         **model_inputs_kwargs: dict[str, Any],
     ) -> tuple | ModelOutput:
         """Forward pass of the modulated model."""
-        # generated_loras -> generated_weights
         generated_weights = None
-        # before: generated_layernorms = None
         if ctx_ids is None and not self.use_base_input_as_ctx:
             logger.warning(
                 (
@@ -862,21 +1001,13 @@ class ModulatedPretrainedModel(nn.Module):
                     else None
                 )
 
-            # before: generated_loras, generated_layernorms = self.generate_weights(...)
             generated_weights = self.generate_weights(
                 ctx_ids, ctx_attn_mask, ctx_position_ids, n_ctx_chunks
             )
 
         if generated_weights is not None:
-            # if USE_RANDOM_REPR:
-            #     print(f"Before combining: {generated_weights.size() = } and {n_ctx_chunks}")
-            #     generated_weights = combine_coeffs(
-            #         generated_weights,
-            #         n_ctx_chunks,
-            #     )
-            #     print(f"After combining: {generated_weights.size() = }")
-            if not USE_RANDOM_REPR:
-                # [tot_chunks -> n_ctx, n_layers, n_modules, r -> r', d_in/out]
+            if not USE_ORTHOG_PROJ:
+                # [tot_chunks -> n_ctx, n_layers, r -> r', d_in/out] for each module
                 # tot_chunks is a number of all chunks: sum(n_ctx_chunks)
                 # n_ctx is a number of contexts: len(n_ctx_chunks)
                 generated_weights = combine_lora(
@@ -910,12 +1041,13 @@ class ModulatedPretrainedModel(nn.Module):
                     device=self.device,
                 )
 
-            if USE_RANDOM_REPR:
-                # print(f"Applying with {generated_weights.size() = }")
-                apply_random_repr(
+            if USE_ORTHOG_PROJ:
+                apply_orthog_proj(
                     self.base_model,
                     self.hypernet.layer_indices,
                     generated_weights,
+                    self.svd,
+                    # curriculum_lambda,
                     n_queries,
                     position_ids,
                     n_ctx_chunks,
@@ -968,7 +1100,6 @@ class ModulatedPretrainedModel(nn.Module):
         model_outputs = self.base_model(*model_inputs_args, **model_inputs_kwargs)
 
         if return_generated_lora:
-            # before: return model_outputs, (generated_loras, generated_layernorms)
             return model_outputs, generated_weights
 
         return model_outputs
@@ -1025,9 +1156,7 @@ class ModulatedPretrainedModel(nn.Module):
         *model_inputs_args: Any,
         **model_inputs_kwargs: dict[str, Any],
     ):
-        # generated_loras -> generated_weights
         generated_weights = None
-        # before: generated_layernorms = None
         if (
             ctx_ids is None and
             not self.generated_loras and
@@ -1070,7 +1199,7 @@ class ModulatedPretrainedModel(nn.Module):
             )
 
         if generated_weights is not None:
-            if not USE_RANDOM_REPR:
+            if not USE_ORTHOG_PROJ:
                 generated_weights = self.combine_lora(
                     generated_weights,
                     n_ctx_chunks,
@@ -1104,11 +1233,12 @@ class ModulatedPretrainedModel(nn.Module):
                     device=self.device,
                 )
 
-            if USE_RANDOM_REPR:
-                apply_random_repr(
+            if USE_ORTHOG_PROJ:
+                apply_orthog_proj(
                     self.base_model,
                     self.hypernet.layer_indices,
                     generated_weights,
+                    self.svd,
                     n_queries,
                     position_ids,
                     n_ctx_chunks,

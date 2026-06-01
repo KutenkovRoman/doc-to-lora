@@ -1066,6 +1066,7 @@ def pack(
         max_packed_inp_len=max_packed_inp_len,
         max_packed_ctx_len=max_packed_ctx_len,
         max_packed_size=max_packed_size,
+        seed=seed,  # added so different seeds produce different cache for datasets
     )
     train_ds_lens = [len(ds) for ds in ds_dict.values()]
     total_samples = sum(train_ds_lens)

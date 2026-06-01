@@ -30,6 +30,8 @@ from transformers.utils import (
     logging,
 )
 
+from einops import repeat
+
 if is_flash_attn_2_available():
     from flash_attn.bert_padding import unpad_input
     from transformers.modeling_flash_attention_utils import _flash_attention_forward
@@ -721,7 +723,7 @@ class Idefics2Perceiver(Idefics2PreTrainedModel):
         self,
         encoder_config: Idefics2PerceiverConfig,
         decoder_config: Idefics2PerceiverConfig,
-        use_random_repr: bool = False, # added
+        use_orthog_proj: bool = False, # added
     ):
         super().__init__(encoder_config)
         self.modality_projection = Idefics2MLP(
@@ -735,16 +737,18 @@ class Idefics2Perceiver(Idefics2PreTrainedModel):
         self.encoder = Idefics2PerceiverResampler._from_config(encoder_config)
         self.decoder = Idefics2PerceiverResampler._from_config(decoder_config)
 
-        self.use_random_repr = use_random_repr
-        self.n_reprs = 8 # probably change
-        self.n_layers = 26 # for gemma-2-2b-it
-        self.r = 8
-        self.in_features = 9216  # for gemma-2-2b-it
-        self.out_features = 2304 # for gemma-2-2b-it
+        # FIX!!! hardcoded values
+        self.n_layers = 26        # for gemma-2-2b-it
+        self.in_features = 9216   # for gemma-2-2b-it
+        self.out_features = 2304  # for gemma-2-2b-it
 
-        logger.debug(
-            f"Using n_repr = {self.n_reprs} with d_in = {self.in_features}, d_out = {self.out_features}"
-        )
+        self.use_orthog_proj = use_orthog_proj
+        # FIX!!! hardcoded values
+        self.max_num_slots = 32
+        self.layer_to_layer = False
+
+        if self.use_orthog_proj:
+            self.slot_table = nn.Embedding(self.max_num_slots + 1, encoder_config.hidden_size)
 
     def forward(
         self,
@@ -759,70 +763,47 @@ class Idefics2Perceiver(Idefics2PreTrainedModel):
             features.size(0) if position_ids is None else
             (position_ids == 0).sum()
         )
-        # print(f"Starting with {features.size() = } and bs = {bs.item()}", flush=True)
 
         projected_inputs = self.modality_projection(features)
 
-        ctx_latents = self.encoder(  # [bs, n_latents, dim]
+        latents = self.encoder(  # [bs, n_latents, dim]
             context=projected_inputs,
             attention_mask=attention_mask,
             position_ids=position_ids,
             precalculated_bs=bs, # for speedup?
         )
-        # print(f"In between with {ctx_latents.size() = }", flush=True)
 
-        if self.use_random_repr:
-            repr_latents = []
-            # for layer_idx in range(self.n_layers):  # mb replace with layer_indices?
-                # stat = torch.cuda.memory.memory_allocated(device=features.device)
-                # print(f"Allocated for {layer_idx = }: {stat / (1024 ** 3):.1f}Gb", flush=True)
-
+        slot_emb = None
+        if self.use_orthog_proj:
+            slot_indices = []
             for n_chunks, seed in zip(n_ctx_chunks, repr_seeds):
-                # seed = seed.item()
-                # generator.manual_seed(seed + layer_idx)
+                if n_chunks == 1:
+                    slot_indices.append(
+                        torch.tensor([self.max_num_slots], device=features.device)
+                    )
+                    continue
+
+                # assert n_chunks <= self.max_num_slots
+
                 generator.manual_seed(seed.item())
-                # stat = torch.cuda.memory.memory_allocated(device=features.device)
-                # print(f"Allocated for seed = {seed.item()}: {stat / (1024 ** 3):.1f}Gb", flush=True)
 
-                with torch.no_grad():
-                    repr_A = torch.randn(
-                        (n_chunks, self.n_reprs, self.r, self.out_features),
-                        generator=generator,
-                        device=features.device,
-                        dtype=features.dtype,
-                    )
-                    repr_B = torch.randn(
-                        (n_chunks, self.n_reprs, self.in_features, self.r),
-                        generator=generator,
-                        device=features.device,
-                        dtype=features.dtype,
-                    )
+                chunk_perm = torch.randperm(
+                    self.max_num_slots, generator=generator, device=features.device
+                )[:n_chunks]
 
-                    projected_repr_A = self.modality_projection(repr_A)
-                    random_repr = torch.matmul(repr_B, projected_repr_A).view(
-                        1, -1, self.modality_projection.down_proj.out_features
-                    )
+                slot_indices.append(chunk_perm)
 
-                    repr_position_ids = torch.arange(
-                        self.n_reprs * self.in_features, device=features.device
-                    ).unsqueeze(0)
-                    repr_position_ids = torch.tile(
-                        repr_position_ids, (1, n_chunks)
-                    )
+            slot_indices = torch.cat(slot_indices, dim=0)  # [tot_chunks,]
+            slot_emb = self.slot_table(slot_indices)  # [tot_chunks, dim]
 
-                    chunk_repr_latents = self.encoder(
-                        context=random_repr,
-                        position_ids=repr_position_ids,
-                        precalculated_bs=n_chunks,
-                    )
-                    repr_latents.append(chunk_repr_latents)
+            if self.layer_to_layer:
+                slot_emb = repeat(  # not tested!!!
+                    slot_emb,
+                    "tot_chunks dim -> (n_layers tot_chunks) dim",
+                    n_layers=self.n_layers,
+                )
 
-            repr_latents = torch.cat(repr_latents, dim=0)
-            # print(f"Now {repr_latents.size() = }", flush=True)
-
-            latents = ctx_latents + repr_latents
-        else:
-            latents = ctx_latents
+            latents = latents + slot_emb.unsqueeze(1)
 
         latent_position_ids = torch.arange(
             self.encoder.n_latents, device=features.device
@@ -834,10 +815,8 @@ class Idefics2Perceiver(Idefics2PreTrainedModel):
             position_ids=latent_position_ids,
             precalculated_bs=bs,
         )
-        # print(f"Finishing with {outputs.size() = }", flush=True)
 
-        # before: return outputs
-        return outputs
+        return outputs, slot_emb
 
 
 __all__ = [
