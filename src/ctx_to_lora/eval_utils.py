@@ -53,7 +53,8 @@ from ctx_to_lora.model_loading import (
 )
 from ctx_to_lora.modeling.context_distillation import CtxDistillModel
 from ctx_to_lora.modeling.generative_adapter import GenerativeAdapter
-from ctx_to_lora.modeling.hypernet import ModulatedPretrainedModel, USE_ORTHOG_PROJ
+from ctx_to_lora.modeling.hypernet import ModulatedPretrainedModel
+from ctx_to_kv_cache.modeling.hyperx import ModulatedPretrainedModelX
 from ctx_to_lora.modeling.llm_lingua import LLMLinguaModel
 from ctx_to_lora.modeling.text_to_lora import TextToLoRA
 from ctx_to_lora.tracker.tracker import (
@@ -729,28 +730,38 @@ def evaluate(
             raise FileNotFoundError(f"Checkpoint {checkpoint_path} not found. ")
         ctx_name = state_dict["ctx_encoder_args"].ctx_encoder_model_name_or_path
 
-        model = ModulatedPretrainedModel.from_state_dict(
-            state_dict,
-            train=False,
-            base_model_kwargs=model_kwargs,
-            use_flash_attn=True,
-            use_sequence_packing=False,  # for generation
-            user_defined_scaling=args.gen_lora_scaling,
-        )
-
-        if getattr(args, "use_llmlingua", False):
-            print("Using LLMLingua-2 for compressing inp")
-            inp_compressor = LLMLinguaModel(
-                model.base_model, tokenizer, args.llmlingua_compression_rate
+        if "hyperx_config" in state_dict:
+            model = ModulatedPretrainedModelX.from_state_dict(
+                state_dict,
+                train=False,
+                base_model_kwargs=model_kwargs,
+                use_flash_attn=True,
             )
-            model.inp_compressor = inp_compressor
+            ctx_model_max_len = model.base_model.config.max_position_embeddings
+            add_tracker(model.base_model.generate, "generate")
+        else:
+            model = ModulatedPretrainedModel.from_state_dict(
+                state_dict,
+                train=False,
+                base_model_kwargs=model_kwargs,
+                use_flash_attn=True,
+                use_sequence_packing=False,  # for generation
+                user_defined_scaling=args.gen_lora_scaling,
+            )
 
-        ctx_model_max_len = model.ctx_encoder.config.max_position_embeddings
-        model.enable_iterative_mode(args.use_iterative_mode)
-        add_tracker(model.base_model.generate, "generate")
-        add_tracker(model.generate_weights, "generate_weights")
-        add_tracker(model.combine_lora, "combine_lora")
-        add_tracker(model.apply_lora_to_layers, "apply_lora_to_layers")
+            if getattr(args, "use_llmlingua", False):
+                print("Using LLMLingua-2 for compressing inp")
+                inp_compressor = LLMLinguaModel(
+                    model.base_model, tokenizer, args.llmlingua_compression_rate
+                )
+                model.inp_compressor = inp_compressor
+
+            ctx_model_max_len = model.ctx_encoder.config.max_position_embeddings
+            model.enable_iterative_mode(args.use_iterative_mode)
+            add_tracker(model.base_model.generate, "generate")
+            add_tracker(model.generate_weights, "generate_weights")
+            add_tracker(model.combine_lora, "combine_lora")
+            add_tracker(model.apply_lora_to_layers, "apply_lora_to_layers")
     else:
         model = base_model = get_model(
             model_name_or_path,
@@ -844,7 +855,7 @@ def evaluate(
         (isinstance(model, PreTrainedModel) and not args.remove_context) or
         isinstance(model, CtxDistillModel) or args.add_ctx_to_input
     )
-    print("Added" if add_ctx_to_chat else "Did not add", "context to chat.")
+    logger.info(("Added" if add_ctx_to_chat else "Did not add") + " context to chat.")
 
     _get_tokenized_dataset = partial(
         get_tokenized_dataset,
@@ -861,6 +872,7 @@ def evaluate(
         add_ctx_to_chat=add_ctx_to_chat,
         add_negative_prompt=False,
         use_kl_loss=False,
+        seed=0,  # added because args does not contain seed and adding it is too bothersome
         max_new_tokens=max_new_tokens,
         set_format="pt",
         add_self_distill_template=use_cd,  # only for eval
@@ -1008,6 +1020,15 @@ def evaluate(
                 f"{args.logging_dir}/{split}_{ds_name}{ds_suffix}_tracked_stats.csv"
             )
             reset_trackers()
+    
+    # if hasattr(model, "alignment_efficiency"):
+    #     mean_over_slots = 0.0
+    #     for j, slot_efficiency in enumerate(model.alignment_efficiency):
+    #         slot_mean = np.array(slot_efficiency).mean().item()
+    #         mean_over_slots += slot_mean
+    #         print(f"Slot {j + 1} mean efficiency: {slot_mean:.6f}")
+    #     mean_over_slots /= len(model.alignment_efficiency)
+    #     print("Mean over slots:", mean_over_slots)
 
     clear_gpu()
     return out

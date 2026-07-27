@@ -3,7 +3,7 @@ import os
 import sys
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Literal, NewType
+from typing import Any, Literal, NewType, Optional, Union
 
 import torch
 import yaml
@@ -88,7 +88,6 @@ class ArgumentParser(HfArgumentParser):
 
             obj = data_class(**inputs)
             outputs.append(obj)
-
         for arg in other_args:
             if arg not in used_args:
                 raise ValueError(f"Argument provided not found in dataclass: {arg}")
@@ -99,13 +98,11 @@ class ArgumentParser(HfArgumentParser):
             # If we pass only one argument to the script and it's the path to a YAML file,
             # let's parse it to get our arguments.
             output = self.parse_yaml_file(os.path.abspath(sys.argv[1].split("=")[-1]))
-
         # parse command line args and yaml file
         elif len(sys.argv) > 2 and sys.argv[1].endswith(".yaml"):
             output = self.parse_yaml_and_args(
                 os.path.abspath(sys.argv[1].split("=")[-1]), sys.argv[2:]
             )
-
         # parse --config for the yaml path and other command line args
         elif any([arg.startswith("--config") for arg in sys.argv]):
             yaml_arg = [
@@ -117,7 +114,6 @@ class ArgumentParser(HfArgumentParser):
             output = self.parse_yaml_and_args(
                 os.path.abspath(yaml_arg.split("=")[-1]), other_args
             )
-
         # parse command line args only
         else:
             output = self.parse_args_into_dataclasses()
@@ -129,6 +125,7 @@ class ArgumentParser(HfArgumentParser):
 
 class ExperimentSetup(str, Enum):
     HYPERLORA = "hyper_lora"
+    HYPERX_KV = "hyperx_kv"
 
 
 @dataclass
@@ -146,14 +143,17 @@ class TrainingArguments(TrainingArguments):
         metadata={"help": "Whether to use bf16 precision."},
     )
     label_names: list[str] = field(
-        default=("labels",),
+        # default_factory (not default=tuple) — HfArgumentParser parses list-typed
+        # fields with nargs="+" and silently drops tuple defaults to None, which
+        # later crashes HF Trainer's eval_loop ("inputs" in None → TypeError).
+        default_factory=lambda: ["labels"],
         metadata={
             "help": "List of strings to specify the label names in the dataset. "
             "This is used to compute the loss and metrics."
         },
     )
     include_for_metrics: list[str] = field(
-        default=("inputs",),
+        default_factory=lambda: ["inputs"],
         metadata={
             "help": "List of strings to specify additional data to include in the `compute_metrics` function."
             "Options: 'inputs', 'loss'."
@@ -173,7 +173,10 @@ class TrainingArguments(TrainingArguments):
             "If not set, will use the same as per_device_eval_batch_size."
         },
     )
-    # TODO: use this! (check trainer.py for proper computation)
+    # False (per-rank token normalization) is the HF Trainer default and normal
+    # practice — NOT a bug. =True gives per-global-token weighting across DDP ranks;
+    # we enable it for the high-L1 NIAH recipe for trajectory stability, but it is a
+    # recipe-tuning choice, not a correctness fix. See debug/niah_collapse_artifacts_2026-05-26.md.
     average_tokens_across_devices: bool = field(
         default=False,
         metadata={"help": "compute num_items_in_batch across devices."},
@@ -227,7 +230,11 @@ class TrainingArguments(TrainingArguments):
         default="cosine_with_min_lr",
         metadata={"help": "Learning rate scheduler type."},
     )
-    lr_scheduler_kwargs: dict = field(
+    # Type matches HF's parent TrainingArguments (`Optional[Union[dict, str]]`)
+    # so HfArgumentParser stores CLI input as a string and the parent
+    # __post_init__ does the json.loads. Plain `dict` here would shadow the
+    # parent type and break `--lr_scheduler_kwargs='{"k":"v"}'` at argparse.
+    lr_scheduler_kwargs: Optional[Union[dict, str]] = field(
         default=None,
         metadata={"help": "Learning rate scheduler kwargs."},
     )
@@ -367,7 +374,9 @@ class CtxTrainingArguments:
             "they will be split up into multiple samples."
         },
     )
-    num_chunk_probs: dict = field(
+    # `Optional[dict | str]` instead of plain `dict` so `--num_chunk_probs='{...}'`
+    # passes argparse as a string; `__post_init__` below json.loads it.
+    num_chunk_probs: Optional[Union[dict, str]] = field(
         default=None,
         metadata={"help": "Probability distribution over chunk nums."},
     )
@@ -422,10 +431,39 @@ class CtxTrainingArguments:
         default=0.0,
         metadata={"help": "L1 regularization coefficient for generated LoRAs."},
     )
+    hyperx_num_prefix_tokens: int = field(
+        default=20,
+        metadata={"help": "HyperX: P virtual prefix rows per layer (kv mode)."},
+    )
+    hyperx_latent_size: int = field(
+        default=2048,
+        metadata={"help": "HyperX: hypernet output-head latent dim."},
+    )
+    hyperx_chunk_combine_mode: str = field(
+        default="concat",
+        metadata={"help": "HyperX: concat | average | sum across ctx chunks."},
+    )
+    hyperx_init_scale: float = field(
+        default=0.02,
+        metadata={"help": "HyperX: out_norm gain / head init scale."},
+    )
+    hyperx_kv_layer_indices: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "HyperX-kv: which base-model layers get the K/V prefix. "
+            "None = all layers (default). Comma list and/or 'a-b' ranges, "
+            "e.g. '18-35' or '0,5,10-12'. Fewer layers = lower memory floor."
+        },
+    )
     add_negative_prompt: bool = field(
         default=False,
         metadata={"help": "Whether to add negative prompt training."},
     )
+
+    def __post_init__(self):
+        if isinstance(self.num_chunk_probs, str):
+            import json
+            self.num_chunk_probs = json.loads(self.num_chunk_probs)
 
 
 @dataclass
@@ -434,6 +472,11 @@ class DataArguments:
         default=None,
         metadata={"help": "Training dataset names."},
     )
+
+    streaming: bool = field(
+        default=False,
+        metadata={"help": "Whether to use streaming dataset for training."},
+    )
     val_ds_names: list[str] | None = field(
         default=None,
         metadata={"help": "Validation dataset names."},
@@ -441,10 +484,6 @@ class DataArguments:
     test_ds_names: list[str] | None = field(
         default=None,
         metadata={"help": "Test dataset names."},
-    )
-    streaming: bool = field(
-        default=False,
-        metadata={"help": "Whether to use streaming dataset for training."},
     )
     max_train_samples_per_ds: int | None = field(
         default=None,
@@ -458,9 +497,9 @@ class DataArguments:
         default=500,
         metadata={"help": "Maximum number of test samples per dataset."},
     )
-    custom_train_splits: list[str] | None = field(
-        default=None,
-        metadata={"help": "Custom splits for a specific training dataset."},
+    test_samples_sequential: bool = field(
+        default=False,
+        metadata={"help": "Take first N test samples instead of random."},
     )
     custom_run_name: str = field(
         default=None,
@@ -511,16 +550,14 @@ class HypernetArguments:
     num_pre_head_layers: int = field(
         default=1, metadata={"help": "# of layers before hypernet head"}
     )
-    chunk_lora_merge_mode: Literal["stack", "avg", "mlp", "deepsets", "attnpool"] = field(
-        default="stack",
+    avg_chunk_loras: bool = field(
+        default=False,
         metadata={
             "help": (
-                "How to combine per-chunk LoRAs when a context is split into multiple chunks. "
-                "'stack': concatenate ranks (original behavior). "
-                "'avg': element-wise mean across chunks. "
-                "'mlp': trainable MLP-based weighted merge initialized to uniform averaging. "
-                "'deepsets': DeepSets-style permutation-invariant weighted merge. "
-                "'attnpool': attention pooling over chunk descriptors."
+                "How to combine per-chunk LoRAs when a context is split into multiple "
+                "chunks. False (default): stack — concatenate ranks, effective rank grows "
+                "with the number of chunks. True: average — element-wise mean across "
+                "chunks, rank stays at base_rank."
             )
         },
     )
@@ -574,7 +611,6 @@ class AggregatorArguments:
         default="mean",
         metadata={"help": "Pooling type for HyperLoRA."},
     )
-
     num_latent_factor: int = field(
         default=8,
         metadata={"help": "Number of latent factors for Perceiver."},
@@ -616,6 +652,5 @@ torch.serialization.add_safe_globals(
 
 if __name__ == "__main__":
     print(ExperimentSetup)
-    print(ExperimentSetup.LORA)
-    print(ExperimentSetup.HYPER_LORA)
-    print(ExperimentSetup.FULL_FINETUNE)
+    print(ExperimentSetup.HYPERLORA)
+    print(ExperimentSetup.HYPERX_KV)

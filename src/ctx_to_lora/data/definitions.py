@@ -125,7 +125,7 @@ DS_KWARGS = {
             split="train",
         )
     ),
-    "babilong_qa_1": dict(
+    "babilong_qa1_external": dict(
         train_0k=dict(path="RMT-team/babilong-1k-samples", split="qa1", name="0k"),
         train_1k=dict(path="RMT-team/babilong-1k-samples", split="qa1", name="1k"),
         train_2k=dict(path="RMT-team/babilong-1k-samples", split="qa1", name="2k"),
@@ -135,6 +135,7 @@ DS_KWARGS = {
         train_32k=dict(path="RMT-team/babilong-1k-samples", split="qa1", name="32k"),
         train_64k=dict(path="RMT-team/babilong-1k-samples", split="qa1", name="64k"),
         train_128k=dict(path="RMT-team/babilong-1k-samples", split="qa1", name="128k"),
+
         test_0k=dict(path="RMT-team/babilong", split="qa1", name="0k"),
         test_1k=dict(path="RMT-team/babilong", split="qa1", name="1k"),
         test_2k=dict(path="RMT-team/babilong", split="qa1", name="2k"),
@@ -144,7 +145,414 @@ DS_KWARGS = {
         test_32k=dict(path="RMT-team/babilong", split="qa1", name="32k"),
         test_64k=dict(path="RMT-team/babilong", split="qa1", name="64k"),
         test_128k=dict(path="RMT-team/babilong", split="qa1", name="128k"),
-    )
+    ),
+    "babilong_qa2_external": dict(
+        train_0k=dict(path="RMT-team/babilong-1k-samples", split="qa2", name="0k"),
+        train_1k=dict(path="RMT-team/babilong-1k-samples", split="qa2", name="1k"),
+        train_2k=dict(path="RMT-team/babilong-1k-samples", split="qa2", name="2k"),
+        train_4k=dict(path="RMT-team/babilong-1k-samples", split="qa2", name="4k"),
+        train_8k=dict(path="RMT-team/babilong-1k-samples", split="qa2", name="8k"),
+        train_16k=dict(path="RMT-team/babilong-1k-samples", split="qa2", name="16k"),
+        train_32k=dict(path="RMT-team/babilong-1k-samples", split="qa2", name="32k"),
+
+        test_0k=dict(path="RMT-team/babilong", split="qa2", name="0k"),
+        test_1k=dict(path="RMT-team/babilong", split="qa2", name="1k"),
+        test_2k=dict(path="RMT-team/babilong", split="qa2", name="2k"),
+        test_4k=dict(path="RMT-team/babilong", split="qa2", name="4k"),
+        test_8k=dict(path="RMT-team/babilong", split="qa2", name="8k"),
+        test_16k=dict(path="RMT-team/babilong", split="qa2", name="16k"),
+        test_32k=dict(path="RMT-team/babilong", split="qa2", name="32k"),
+    ),
+
+    "babilong_qa1_zero": dict(
+        train=dict(
+            path="json",
+            data_files="./data/raw_datasets/babilong_qa1/0_tokens/train.jsonl",
+            split="train"
+        ),
+        validation=dict(
+            path="json",
+            data_files="./data/raw_datasets/babilong_qa1/0_tokens/test.jsonl",
+            split="train"
+        ),
+    ),
+    "babilong_qa1_mixed": dict(
+        train=dict(
+            path="json",
+            data_files=[
+                f"./data/raw_datasets/babilong_qa1/{64 * i}_tokens/train.jsonl"
+                for i in range(6)
+            ],
+            split="train"
+        ),
+        validation=dict(
+            path="json",
+            data_files=[
+                "./data/raw_datasets/babilong_qa1/0_tokens/test.jsonl",
+                "./data/raw_datasets/babilong_qa1/256_tokens/test.jsonl",
+            ],
+            split="train"
+        ),
+    ),
+
+    "babilong_qa1_0_512": dict(
+        train=dict(
+            path="json",
+            data_files=[
+                f"./data/raw_datasets/babilong_qa1/{32 * i}_tokens/train.jsonl"
+                for i in range(16)
+            ],
+            split="train"
+        ),
+        validation=dict(
+            path="json",
+            data_files=[
+                "./data/raw_datasets/babilong_qa1/0_tokens/test.jsonl",
+                "./data/raw_datasets/babilong_qa1/256_tokens/test.jsonl",
+            ],
+            split="train"
+        ),
+    ),
+    "babilong_qa1_512_1024": dict(
+        train=dict(
+            path="json",
+            data_files=[
+                f"./data/raw_datasets/babilong_qa1/{32 * i}_tokens/train.jsonl"
+                for i in range(16, 32)
+            ],
+            split="train"
+        ),
+        validation=dict(
+            path="json",
+            data_files=[
+                "./data/raw_datasets/babilong_qa1/512_tokens/test.jsonl",
+                "./data/raw_datasets/babilong_qa1/768_tokens/test.jsonl",
+            ],
+            split="train"
+        ),
+    ),
+
+    "babilong_qa1_1024_2048": dict(
+        validation=dict(
+            path="json",
+            data_files="./data/raw_datasets/babilong_qa1/1536_tokens/test.jsonl",
+            split="train"
+        )
+    ),
+    "babilong_qa1_3072_4096": dict(
+        validation=dict(
+            path="json",
+            data_files="./data/raw_datasets/babilong_qa1/3584_tokens/test.jsonl",
+            split="train"
+        )
+    ),
+    "babilong_qa1_7168_8192": dict(
+        validation=dict(
+            path="json",
+            data_files="./data/raw_datasets/babilong_qa1/7680_tokens/test.jsonl",
+            split="train"
+        )
+    ),
+    "babilong_qa1_15360_16384": dict(
+        validation=dict(
+            path="json",
+            data_files="./data/raw_datasets/babilong_qa1/15872_tokens/test.jsonl",
+            split="train"
+        )
+    ),
+    "babilong_qa1_28672_32768": dict(
+        validation=dict(
+            path="json",
+            data_files="./data/raw_datasets/babilong_qa1/30720_tokens/test.jsonl",
+            split="train"
+        )
+    ),
+    "babilong_qa1_57344_65536": dict(
+        validation=dict(
+            path="json",
+            data_files="./data/raw_datasets/babilong_qa1/61440_tokens/test.jsonl",
+            split="train"
+        )
+    ),
+
+
+    "babilong_qa2_zero": dict(
+        train=dict(
+            path="json",
+            data_files="./data/raw_datasets/babilong_qa2/0_tokens/train.jsonl",
+            split="train"
+        ),
+        validation=dict(
+            path="json",
+            data_files="./data/raw_datasets/babilong_qa2/0_tokens/test.jsonl",
+            split="train"
+        ),
+    ),
+
+    "babilong_qa2_0_512": dict(
+        train=dict(
+            path="json",
+            data_files=[
+                f"./data/raw_datasets/babilong_qa2/{32 * i}_tokens/train.jsonl"
+                for i in range(16)
+            ],
+            split="train"
+        ),
+        validation=dict(
+            path="json",
+            data_files=[
+                "./data/raw_datasets/babilong_qa2/0_tokens/test.jsonl",
+                "./data/raw_datasets/babilong_qa2/256_tokens/test.jsonl",
+            ],
+            split="train"
+        ),
+    ),
+    "babilong_qa2_512_1024": dict(
+        train=dict(
+            path="json",
+            data_files=[
+                f"./data/raw_datasets/babilong_qa2/{32 * i}_tokens/train.jsonl"
+                for i in range(16, 32)
+            ],
+            split="train"
+        ),
+        validation=dict(
+            path="json",
+            data_files=[
+                "./data/raw_datasets/babilong_qa2/512_tokens/test.jsonl",
+                "./data/raw_datasets/babilong_qa2/768_tokens/test.jsonl",
+            ],
+            split="train"
+        ),
+    ),
+
+    "babilong_qa2_1024_2048": dict(
+        validation=dict(
+            path="json",
+            data_files="./data/raw_datasets/babilong_qa2/1536_tokens/test.jsonl",
+            split="train"
+        )
+    ),
+    "babilong_qa2_3072_4096": dict(
+        validation=dict(
+            path="json",
+            data_files="./data/raw_datasets/babilong_qa2/3584_tokens/test.jsonl",
+            split="train"
+        )
+    ),
+    "babilong_qa2_7168_8192": dict(
+        validation=dict(
+            path="json",
+            data_files="./data/raw_datasets/babilong_qa2/7680_tokens/test.jsonl",
+            split="train"
+        )
+    ),
+    "babilong_qa2_15360_16384": dict(
+        validation=dict(
+            path="json",
+            data_files="./data/raw_datasets/babilong_qa2/15872_tokens/test.jsonl",
+            split="train"
+        )
+    ),
+    "babilong_qa2_28672_32768": dict(
+        validation=dict(
+            path="json",
+            data_files="./data/raw_datasets/babilong_qa2/30720_tokens/test.jsonl",
+            split="train"
+        )
+    ),
+    "babilong_qa2_57344_65536": dict(
+        validation=dict(
+            path="json",
+            data_files="./data/raw_datasets/babilong_qa2/61440_tokens/test.jsonl",
+            split="train"
+        )
+    ),
+
+
+    "ab_qa1_32_128": dict(
+        train=dict(
+            path="json",
+            data_files=[
+                "./data/raw_datasets/ab_qa1/32_tokens/train.jsonl",
+                "./data/raw_datasets/ab_qa1/57_tokens/train.jsonl",
+                "./data/raw_datasets/ab_qa1/82_tokens/train.jsonl",
+                "./data/raw_datasets/ab_qa1/107_tokens/train.jsonl",
+            ],
+            split="train"
+        ),
+        validation=dict(
+            path="json",
+            data_files=[
+                "./data/raw_datasets/ab_qa1/32_tokens/test.jsonl",
+                "./data/raw_datasets/ab_qa1/57_tokens/test.jsonl",
+                "./data/raw_datasets/ab_qa1/82_tokens/test.jsonl",
+                "./data/raw_datasets/ab_qa1/107_tokens/test.jsonl",
+            ],
+            split="train"
+        ),
+    ),
+    "ab_qa1_128_256": dict(
+        train=dict(
+            path="json",
+            data_files=[
+                "./data/raw_datasets/ab_qa1/132_tokens/train.jsonl",
+                "./data/raw_datasets/ab_qa1/157_tokens/train.jsonl",
+                "./data/raw_datasets/ab_qa1/182_tokens/train.jsonl",
+                "./data/raw_datasets/ab_qa1/207_tokens/train.jsonl",
+                "./data/raw_datasets/ab_qa1/232_tokens/train.jsonl",
+            ],
+            split="train"
+        ),
+        validation=dict(
+            path="json",
+            data_files=[
+                "./data/raw_datasets/ab_qa1/132_tokens/test.jsonl",
+                "./data/raw_datasets/ab_qa1/157_tokens/test.jsonl",
+                "./data/raw_datasets/ab_qa1/182_tokens/test.jsonl",
+                "./data/raw_datasets/ab_qa1/207_tokens/test.jsonl",
+                "./data/raw_datasets/ab_qa1/232_tokens/test.jsonl",
+            ],
+            split="train"
+        ),
+    ),
+    "ab_qa1_512_1024": dict(
+        validation=dict(
+            path="json",
+            data_files=[
+                f"./data/raw_datasets/ab_qa1/{512 + 25 * i}_tokens/test.jsonl"
+                for i in range(21)
+            ],
+            split="train"
+        )
+    ),
+    "ab_qa1_1024_2048": dict(
+        validation=dict(
+            path="json",
+            data_files=[
+                "./data/raw_datasets/ab_qa1/1024_tokens/test.jsonl",
+                "./data/raw_datasets/ab_qa1/1536_tokens/test.jsonl",
+                "./data/raw_datasets/ab_qa1/2048_tokens/test.jsonl",
+            ],
+            split="train"
+        )
+    ),
+    
+    "ab_qa1_3072_4096": dict(
+        validation=dict(
+            path="json",
+            data_files="./data/raw_datasets/ab_qa1/3584_tokens/test.jsonl",
+            split="train"
+        )
+    ),
+    "ab_qa1_7168_8192": dict(
+        validation=dict(
+            path="json",
+            data_files="./data/raw_datasets/ab_qa1/7680_tokens/test.jsonl",
+            split="train"
+        )
+    ),
+    "ab_qa1_15360_16384": dict(
+        validation=dict(
+            path="json",
+            data_files="./data/raw_datasets/ab_qa1/15872_tokens/test.jsonl",
+            split="train"
+        )
+    ),
+    "ab_qa1_28672_32768": dict(
+        validation=dict(
+            path="json",
+            data_files="./data/raw_datasets/ab_qa1/30720_tokens/test.jsonl",
+            split="train"
+        )
+    ),
+    "ab_qa1_57344_65536": dict(
+        validation=dict(
+            path="json",
+            data_files="./data/raw_datasets/ab_qa1/61440_tokens/test.jsonl",
+            split="train"
+        )
+    ),
+    "ab_qa1_122880_131072": dict(
+        validation=dict(
+            path="json",
+            data_files="./data/raw_datasets/ab_qa1/126976_tokens/test.jsonl",
+            split="train"
+        )
+    ),
+
+    "ab_qa1_zero": dict(
+        train=dict(
+            path="json", data_files="./data/raw_datasets/ab_qa1/-1_tokens/train.jsonl", split="train"
+        ),
+        validation=dict(
+            path="json", data_files="./data/raw_datasets/ab_qa1/-1_tokens/test.jsonl", split="train"
+        ),
+    ),
+
+
+    "babilong_qa2_cot_zero": dict(
+        train=dict(
+            path="json",
+            data_files="./data/raw_datasets/babilong_qa2_cot/0_tokens/train.jsonl",
+            split="train"
+        ),
+        validation=dict(
+            path="json",
+            data_files="./data/raw_datasets/babilong_qa2_cot/0_tokens/test.jsonl",
+            split="train"
+        ),
+    ),
+    
+    "babilong_qa2_cot_0_512": dict(
+        train=dict(
+            path="json",
+            data_files=[
+                f"./data/raw_datasets/babilong_qa2_cot/{32 * i}_tokens/train.jsonl"
+                for i in range(16)
+            ],
+            split="train"
+        ),
+        validation=dict(
+            path="json",
+            data_files=[
+                "./data/raw_datasets/babilong_qa2_cot/0_tokens/test.jsonl",
+                "./data/raw_datasets/babilong_qa2_cot/256_tokens/test.jsonl",
+            ],
+            split="train"
+        ),
+    ),
+    "babilong_qa2_cot_512_1024": dict(
+        train=dict(
+            path="json",
+            data_files=[
+                f"./data/raw_datasets/babilong_qa2_cot/{32 * i}_tokens/train.jsonl"
+                for i in range(16, 32)
+            ],
+            split="train"
+        ),
+        validation=dict(
+            path="json",
+            data_files=[
+                "./data/raw_datasets/babilong_qa2_cot/512_tokens/test.jsonl",
+                "./data/raw_datasets/babilong_qa2_cot/768_tokens/test.jsonl",
+            ],
+            split="train"
+        ),
+    ),
+
+    "tool_mix_single_tool": dict(
+        train=dict(
+            path="json",
+            data_files="/home/jovyan/veprikov/PRAG-custom/glaive_prag_table3/data/train_single_tool.jsonl",
+            split="train"
+        ),
+        validation=dict(
+            path="json",
+            data_files="/home/jovyan/veprikov/PRAG-custom/glaive_prag_table3/data/val_single_tool.jsonl",
+            split="train"
+        ),
+    ),
 }
 
 # add ctx_numbers
@@ -267,7 +675,8 @@ EVAL_INTX_TEMPLATES = {
     "longbench/multifieldqa_en": "Answer the following question. Only output the answer and do not output any other words.\n\nQuestion: {input}",
     "longbench/2wikimqa": "Answer the following question. Only output the answer and do not output any other words.\n\nQuestion: {input}",
     # babilong
-    "babilong_qa_1": "Answer the following question. If a person was in different locations, use the latest location to answer the question. Output only the location and do not output any other words.\n\nQuestion: {input}",
+    "babilong_qa1_external": "Answer the following question. If a person was in different locations, use the latest location to answer the question. Output only the location and do not output any other words.\n\nQuestion: {input}",
+    "babilong_qa2_external": "Answer the following question. If a person got an item in the first location and travelled to the second location the item is also in the second location. If a person dropped an item in the first location and moved to the second location the item remains in the first location. Output only the location and do not output any other words.\n\nQuestion: {input}",
 }
 
 for ds_name in LONGBENCH_E_TASKS:

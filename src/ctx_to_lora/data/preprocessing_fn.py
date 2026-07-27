@@ -158,16 +158,68 @@ def get_preprocessing_fn(
             q = closed_qa_prompting(q) if not is_eval else q
             return {"context": ctx, "prompt": q, "response": response}
 
-    elif ds_name.startswith("babilong"):
+    elif ds_name.startswith("babilong_qa1"):
 
         def f(sample):
             return {
-                "context": sample["input"].replace("\n", " "),  #.rstrip(".,:;!?-\'\" ")
+                "context": sample["input"].replace("\n\n\n", " ").replace("\n\n", " ").replace("\n", " "),
                 # For now prompt only has a question unlike in babilong repo where there are
                 # additional examples and instruction on how to format answer
-                "prompt": sample["question"],
+                "prompt": sample["question"] + (
+                    "Use the latest location to answer the question. Output only the location and do not output any other words."
+                    if not ds_name.endswith("external") else ""
+                ),
                 "response": sample["target"],
             }
+
+    elif ds_name.startswith("babilong_qa2"):
+
+        def f(sample):
+            return {
+                "context": sample["input"].replace("\n\n\n", " ").replace("\n\n", " ").replace("\n", " "),
+                # For now prompt only has a question unlike in babilong repo where there are
+                # additional examples and instruction on how to format answer
+                "prompt": sample["question"] + (
+                    "If a person got an item in the first location and travelled to the second location the item is also in the second location. If a person dropped an item in the first location and moved to the second location the item remains in the first location."
+                    # " Output only the location and do not output any other words."
+                    if not ds_name.endswith("external") else ""
+                ),
+                "response": sample["target"],
+            }
+    
+    elif ds_name.startswith("ab_qa1"):
+
+        def f(sample):
+            return {
+                "context": sample["input"].replace("\n", " "),
+                "prompt": sample["question"] + "Output only the location and do not output any other words.",
+                # "prompt": sample["question"][:-1],
+                "response": sample["target"],
+                # "response": ("Alice" if "Alice" in sample["question"] else "Bob") + " is in the " + sample["target"],
+            }
+
+    elif ds_name == "tool_mix_single_tool":
+        HEADER = (
+            "You are a helpful LLM agent that calls all necessary tools (usually, more than "
+            "one in total) and uses the information from those tools to fulfill the user's "
+            "request as accurately as possible. You are given a question and a set of possible "
+            "functions.\nBased on the question, you will need to make one or more function/tool "
+            "calls to achieve the purpose.\nYou should only return the function call in tool call "
+            "sections.\nHere is a list of functions in JSON format that you can invoke:\n"
+        )
+        FOOTER = (
+            "\nShould you decide to return the function call(s). Put it in the format of "
+            "[func1(params_name=params_value, params_name2=params_value2...), func2(params)]\n\n"
+            "NO other text MUST be included."
+        )
+
+        def f(sample):
+            return {
+                "context": HEADER + sample["available_tools"] + FOOTER,
+                "prompt": sample["prompt"],
+                "response": sample["response"],
+            }
+
 
     if is_eval and (ds_name in EVAL_INTX_TEMPLATES):
         prompt_template = EVAL_INTX_TEMPLATES[ds_name]
